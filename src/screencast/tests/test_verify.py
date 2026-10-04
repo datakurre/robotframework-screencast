@@ -304,6 +304,106 @@ def test_verify_warns_when_waiting_adds_up_though_no_wait_is_long(tmp_path):
 
 
 @requires_ffmpeg
+def test_verify_does_not_count_a_wait_covered_by_a_focused_track_as_dead_air(
+    tmp_path,
+):
+    """(regression) A wait while the main view is a focused track (e.g. an
+    ambient terminal scrolling its own real output -- see compose.py's own
+    module docstring on focusable tracks) is not dead air: the composed
+    output has real, independently live content on screen for exactly
+    that stretch, even though the actor/observer themselves are not being
+    driven at that moment."""
+    take_dir = tmp_path / "take"
+    timeline = make_take(take_dir, observer_duration=6.0, with_turn=False)
+    make_animated_clip(take_dir / "terminal.webm", 6.0)
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.add_event(
+        {
+            "type": "focus",
+            "time": 1.0,
+            "view": "terminal",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+        }
+    )
+    timeline.add_event(
+        {
+            "type": "wait",
+            "time": 2.0,
+            "duration": 12.0,
+            "keyword": "Wait Until Keyword Succeeds",
+        }
+    )
+    timeline.save(take_dir / "timeline.json")
+    compose(take_dir)
+    report = verify(take_dir)
+    assert not any(f["check"] == "dead_air" for f in report["findings"])
+    assert report["waited_seconds"] == 0.0
+    assert report["ok"]
+
+
+@requires_ffmpeg
+def test_verify_does_not_count_a_wait_covered_by_a_live_inset_track_as_dead_air(
+    tmp_path,
+):
+    """A track never need become *main* to cover a wait: one recorded with
+    start_track(..., focusable=False) -- e.g. a shell that should always
+    stay a corner inset, never full-frame -- still has real, independently
+    changing content on screen in its own corner for as long as it has not
+    yet run out. 'focusable' only ever concerns eligibility to become main
+    (see compose.py's own trackClip docstring); it says nothing about
+    whether the track's own inset is live, so it must not gate dead_air
+    coverage either."""
+    take_dir = tmp_path / "take"
+    timeline = make_take(take_dir, observer_duration=15.0, with_turn=False)
+    make_animated_clip(take_dir / "terminal.webm", 15.0)
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0, focusable=False)
+    timeline.add_event(
+        {
+            "type": "wait",
+            "time": 2.0,
+            "duration": 12.0,
+            "keyword": "Wait Until Keyword Succeeds",
+        }
+    )
+    timeline.save(take_dir / "timeline.json")
+    compose(take_dir)
+    report = verify(take_dir)
+    assert not any(f["check"] == "dead_air" for f in report["findings"])
+    assert report["waited_seconds"] == 0.0
+    assert report["ok"]
+
+
+@requires_ffmpeg
+def test_verify_counts_a_wait_as_dead_air_when_a_solo_focus_hides_the_track(
+    tmp_path,
+):
+    """(regression) A `solo` focus turns every inset off, a live track's
+    included -- so that track no longer covers a wait under it, and the
+    wait is dead air on screen again."""
+    take_dir = tmp_path / "take"
+    timeline = make_take(take_dir, observer_duration=15.0, with_turn=False)
+    make_animated_clip(take_dir / "terminal.webm", 15.0)
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0, focusable=False)
+    timeline.add_event({"type": "focus", "time": 1.0, "view": "observer", "solo": True})
+    timeline.add_event(
+        {
+            "type": "wait",
+            "time": 2.0,
+            "duration": 12.0,
+            "keyword": "Wait Until Keyword Succeeds",
+        }
+    )
+    timeline.save(take_dir / "timeline.json")
+    compose(take_dir)
+    report = verify(take_dir)
+    finding = next(f for f in report["findings"] if f["check"] == "dead_air")
+    assert finding["severity"] == "error"
+    assert not report["ok"]
+
+
+@requires_ffmpeg
 def test_verify_samples_each_turn_of_a_repeated_actor_at_its_own_midpoint(
     tmp_path, monkeypatch
 ):
@@ -338,6 +438,68 @@ def test_verify_samples_each_turn_of_a_repeated_actor_at_its_own_midpoint(
     monkeypatch.setattr(verify_module, "frame_luma_range", spy)
     verify(take_dir)
     assert observer_samples == [pytest.approx(2.0), pytest.approx(6.0)]
+
+
+@requires_ffmpeg
+def test_verify_still_counts_a_wait_as_dead_air_once_its_covering_track_has_ended(
+    tmp_path,
+):
+    """Negative control for the test above: a track that has already run
+    out (frozen on its last frame, per compose.py's track_slice()) before
+    the wait is even over does not cover it -- otherwise a track's mere
+    *existence* anywhere in the take would silently exempt every wait from
+    dead_air, including ones genuinely longer than anything the track ever
+    showed."""
+    take_dir = tmp_path / "take"
+    timeline = make_take(take_dir, observer_duration=16.0, with_turn=False)
+    make_animated_clip(take_dir / "terminal.webm", 5.0)  # ends at t=5.0
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.add_event(
+        {
+            "type": "wait",
+            "time": 2.0,
+            "duration": 12.0,  # spans [2.0, 14.0) -- outlives the track
+            "keyword": "Wait Until Keyword Succeeds",
+        }
+    )
+    timeline.save(take_dir / "timeline.json")
+    compose(take_dir)
+    report = verify(take_dir)
+    finding = next(f for f in report["findings"] if f["check"] == "dead_air")
+    assert finding["severity"] == "error"
+    assert not report["ok"]
+
+
+@requires_ffmpeg
+def test_verify_does_not_probe_a_tracks_video_when_there_are_no_waits(
+    tmp_path, monkeypatch
+):
+    """(efficiency) track_durations used to be built eagerly for every
+    track up front, even though its only consumer (_covered_by_a_track(),
+    via the dead_air check) is never reached when the timeline has no
+    `wait` events at all -- paying for an ffprobe subprocess per track for
+    nothing on a take with no waits to check. Probing is now lazy and
+    memoized per name."""
+    take_dir = tmp_path / "take"
+    timeline = make_take(take_dir, observer_duration=4.0, with_turn=False)
+    make_animated_clip(take_dir / "terminal.webm", 4.0)
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.save(take_dir / "timeline.json")
+    compose(take_dir)
+
+    import screencast.verify as verify_module
+
+    real_ffprobe_duration = verify_module.ffprobe_duration
+    probed = []
+
+    def spy(path):
+        probed.append(path)
+        return real_ffprobe_duration(path)
+
+    monkeypatch.setattr(verify_module, "ffprobe_duration", spy)
+    verify(take_dir)
+
+    assert (take_dir / "terminal.webm") not in probed
 
 
 @requires_ffmpeg

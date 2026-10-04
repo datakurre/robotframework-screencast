@@ -19,6 +19,7 @@ from screencast.verify import parse_vtt_cue_times
 import pytest
 import shutil
 import subprocess
+import warnings
 
 
 # (turn_id, actor, start, end) -- turn_id, not actor name, is what _view_at
@@ -60,6 +61,139 @@ def test_gap_focus_event_can_bring_back_the_actor():
     focus = [{"time": 3.5, "view": "actor", "scale": 0.4, "margin": 24, "border": 3}]
     view, turn_id, *_ = _view_at(4.0, focus, TURNS)
     assert (view, turn_id) == ("actor", 0)
+
+
+def test_solo_defaults_to_false_when_a_focus_event_omits_it():
+    focus = [{"time": 1.5, "view": "observer", "scale": 0.4, "margin": 24, "border": 3}]
+    *_, solo = _view_at(2.0, focus, TURNS)
+    assert solo is False
+
+
+def test_solo_is_true_inside_a_turn_when_the_focus_event_asks_for_it():
+    focus = [
+        {
+            "time": 1.5,
+            "view": "observer",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+            "solo": True,
+        }
+    ]
+    view, turn_id, _scale, _margin, _border, solo = _view_at(2.0, focus, TURNS)
+    assert (view, turn_id, solo) == ("observer", 0, True)
+
+
+def test_solo_is_true_in_a_gap_when_the_focus_event_asks_for_it():
+    """The case this exists for: ending a take on the main view alone, with
+    no actor/observer cross-inset and no track inset, after an earlier
+    turn or track has already made one available -- nothing else in the
+    timeline vocabulary can turn an inset back off (see _view_at's own
+    docstring)."""
+    focus = [
+        {
+            "time": 3.5,
+            "view": "observer",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+            "solo": True,
+        }
+    ]
+    view, turn_id, _scale, _margin, _border, solo = _view_at(4.0, focus, TURNS)
+    assert (view, turn_id, solo) == ("observer", 0, True)
+
+
+def test_solo_carries_through_when_a_focus_event_makes_a_track_main():
+    focus = [
+        {
+            "time": 1.5,
+            "view": "terminal",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+            "solo": True,
+        }
+    ]
+    view, turn_id, _scale, _margin, _border, solo = _view_at(
+        2.0, focus, TURNS, track_names={"terminal"}
+    )
+    assert (view, turn_id, solo) == ("track:terminal", 0, True)
+
+
+def test_focus_on_a_known_track_name_becomes_main_with_the_active_turn_as_inset_id():
+    focus = [{"time": 1.5, "view": "terminal", "scale": 0.4, "margin": 24, "border": 3}]
+    view, turn_id, *_ = _view_at(2.0, focus, TURNS, track_names={"terminal"})
+    assert (view, turn_id) == ("track:terminal", 0)
+
+
+def test_focus_on_an_unknown_track_name_falls_back_to_ordinary_resolution():
+    """A name that isn't in `track_names` (never recorded, or an external
+    tracks=/--track entry, which is never focusable) is treated the same as
+    any other non-'actor' value inside a turn: falls through to 'observer',
+    exactly as it did before track names existed at all -- never silently
+    rendering nothing for an unrecognized name."""
+    focus = [{"time": 1.5, "view": "terminal", "scale": 0.4, "margin": 24, "border": 3}]
+    view, turn_id, *_ = _view_at(2.0, focus, TURNS, track_names=frozenset())
+    assert (view, turn_id) == ("observer", 0)
+
+
+def test_focus_on_a_track_outside_any_turn_still_resolves_to_the_gaps_inset_turn():
+    focus = [{"time": 3.5, "view": "terminal", "scale": 0.4, "margin": 24, "border": 3}]
+    view, turn_id, *_ = _view_at(4.0, focus, TURNS, track_names={"terminal"})
+    assert (view, turn_id) == ("track:terminal", 0)
+
+
+def test_focus_on_a_track_not_yet_started_falls_back_to_ordinary_resolution():
+    """(regression) A known, focusable track name used to resolve to
+    'track:<name>' with no check that the track had actually started
+    recording by `t` yet -- contradicting the schema's own documented
+    contract ("falls back to 'observer' ... not yet available at this
+    point in the take") and disagreeing with the inset loop's own
+    `start < track["offset"]` guard, which already skips an unavailable
+    track. `track_windows` closes that gap."""
+    focus = [{"time": 1.5, "view": "terminal", "scale": 0.4, "margin": 24, "border": 3}]
+    view, turn_id, *_ = _view_at(
+        2.0,
+        focus,
+        TURNS,
+        track_names={"terminal"},
+        track_windows={"terminal": (5.0, 10.0)},
+    )
+    assert (view, turn_id) == ("observer", 0)
+
+
+def test_focus_on_a_track_already_finished_falls_back_to_ordinary_resolution():
+    """Counterpart to the not-yet-started case above: a track that had
+    already run out by `t` must fall back the same way, not freeze on (or
+    otherwise reuse) footage that no longer exists at that point. `t=2.5`
+    stays inside TURNS' own first turn (1.0, 3.0) -- same window the focus
+    event's own scope (from the turn's start) is checked against -- so
+    this exercises the active-turn fallback branch, not a gap."""
+    focus = [{"time": 1.5, "view": "terminal", "scale": 0.4, "margin": 24, "border": 3}]
+    view, turn_id, *_ = _view_at(
+        2.5,
+        focus,
+        TURNS,
+        track_names={"terminal"},
+        track_windows={"terminal": (0.0, 2.0)},
+    )
+    assert (view, turn_id) == ("observer", 0)
+
+
+def test_focus_on_a_track_within_its_window_still_becomes_main():
+    """Positive control for the two tests above: a track that has started
+    and not yet finished still resolves to main, exactly as before
+    `track_windows` existed."""
+    focus = [{"time": 1.5, "view": "terminal", "scale": 0.4, "margin": 24, "border": 3}]
+    view, turn_id, *_ = _view_at(
+        2.0,
+        focus,
+        TURNS,
+        track_names={"terminal"},
+        track_windows={"terminal": (0.0, 10.0)},
+    )
+    assert (view, turn_id) == ("track:terminal", 0)
 
 
 REPEATED_ACTOR_TURNS = [
@@ -300,6 +434,77 @@ def test_compose_drops_the_whole_lead_in_even_with_an_event_inside_it(tmp_path):
     from screencast.verify import predicted_duration
 
     assert predicted_duration(timeline, 8.0) == pytest.approx(5.0)
+
+
+def _compose_filter_complex(take_dir, monkeypatch, durations):
+    """Compose `take_dir` without running ffmpeg or ffprobe -- `durations`
+    maps each clip's file name to its length -- and return the
+    filter_complex compose() built."""
+    captured = {}
+
+    def fake_ffmpeg(*args, capture=True):
+        captured["args"] = args
+        Path(args[-1]).write_bytes(b"")
+
+    monkeypatch.setattr(compose_module, "ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(
+        compose_module, "ffprobe_duration", lambda path: durations[Path(path).name]
+    )
+    compose(take_dir)
+    args = captured["args"]
+    return args[args.index("-filter_complex") + 1]
+
+
+def test_compose_cuts_at_a_tracks_own_start_so_a_promoted_track_stays_in_sync(
+    tmp_path, monkeypatch
+):
+    """(regression) `Focus terminal` at 10.0s, the track only starting at
+    12.0s, and no other boundary until 20.0s: the [10, 20) segment's
+    midpoint found the track available and played its footage from its own
+    t=0 at 10.0s -- 2s early, freezing its last frame for the final 2s. The
+    track's start is now a boundary: observer until 12.0s, then the track
+    in sync."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=12.0)
+    timeline.add_event({"type": "focus", "time": 10.0, "view": "terminal"})
+    timeline.add_event({"type": "hold", "time": 20.0, "duration": 1.0})
+    timeline.save(take_dir / "timeline.json")
+
+    filter_complex = _compose_filter_complex(
+        take_dir, monkeypatch, {"observer.webm": 25.0, "terminal.webm": 13.0}
+    )
+    # Input 1 is the track. The segment ending at 12.0 is the observer's...
+    assert "[0:v]trim=start=10.000:end=12.000" in filter_complex
+    # ...and the track, as main from 12.0, starts at its own t=0 and runs
+    # in step with the observer clock up to the hold at 20.0.
+    assert "[1:v]trim=start=0.000:end=8.000" in filter_complex
+    # Its own end (12.0 + 13.0 = 25.0) is the observer's end too, so the
+    # last segment is a plain trim, no freeze.
+    assert "[1:v]trim=start=8.000:end=13.000" in filter_complex
+
+
+def test_compose_cuts_at_a_tracks_own_end(tmp_path, monkeypatch):
+    """A focused track running out mid-segment hands back to ordinary
+    resolution at its own end, instead of freezing for the segment's rest."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.add_event({"type": "focus", "time": 1.0, "view": "terminal"})
+    timeline.save(take_dir / "timeline.json")
+
+    filter_complex = _compose_filter_complex(
+        take_dir, monkeypatch, {"observer.webm": 10.0, "terminal.webm": 6.0}
+    )
+    # Main from 1.0 to its own end at 6.0, a plain trim with no freeze...
+    assert (
+        "[1:v]trim=start=1.000:end=6.000,setpts=PTS-STARTPTS,scale=1920:1080,fps=25"
+        in filter_complex
+    )
+    # ...then the observer is main again.
+    assert "[0:v]trim=start=6.000:end=10.000" in filter_complex
 
 
 @requires_ffmpeg
@@ -674,3 +879,739 @@ def test_compose_with_captions_writes_a_vtt_sidecar_accounting_for_the_title_car
 
 
 # -- External PiP tracks (`tracks=`/`--track`) --------------------------
+
+
+@requires_ffmpeg
+def test_compose_with_a_track_covering_the_take_is_hidden_behind_a_title_card(
+    tmp_path,
+):
+    """A track spanning the whole take appears during live segments but is
+    absent during a chapter card's span -- the hook point is the main
+    per-boundary loop's own segment label only, which a chapter's own
+    (independently appended) segment never passes through."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 5.0, color="blue")
+    make_clip(take_dir / "author.webm", 3.0, color="red")
+    make_clip(take_dir / "terminal.webm", 5.0, color="yellow")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_actor_clip("author", "author.webm", offset=1.0, duration=3.0)
+    timeline.add_event({"type": "turn_start", "time": 1.0, "actor": "author"})
+    timeline.add_event(
+        {
+            "type": "chapter",
+            "time": 1.0,
+            "eyebrow": "Story",
+            "title": "Author",
+            "subtitle": "Doing a thing",
+            "duration": 2.0,
+        }
+    )
+    timeline.add_event({"type": "turn_end", "time": 4.0, "actor": "author"})
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(
+        take_dir,
+        tracks=[
+            {"name": "terminal", "video": take_dir / "terminal.webm", "offset": 0.0}
+        ],
+    )
+    # Same total as the no-track regression case this setup is borrowed from
+    # (test_compose_opens_on_the_title_card_when_the_first_chapter_precedes_
+    # its_turn): 2.0s title card + 3.0s turn + 1.0s trailing gap = 6.0s --
+    # a track never changes the composed output's own duration.
+    assert ffprobe_duration(output) == pytest.approx(6.0, abs=0.5)
+
+    # During the title card (output [0.0, 2.0)): the track must not show
+    # through underneath it.
+    assert not is_color(corner_pixel(output, 1.0, "bottom-left"), "yellow")
+    # During the live turn segment (output [2.0, 5.0)): the track is visible.
+    assert is_color(corner_pixel(output, 3.0, "bottom-left"), "yellow")
+    # During the trailing observer-only gap (output [5.0, 6.0)): still
+    # visible -- the track's own 5.0s footage covers this raw span too.
+    assert is_color(corner_pixel(output, 5.5, "bottom-left"), "yellow")
+
+
+@requires_ffmpeg
+def test_compose_with_a_track_shorter_than_the_take_freezes_its_tail(tmp_path):
+    """A track shorter than the composed output keeps showing (its last
+    frame, frozen) for the rest of the take, and never changes the
+    composed output's own duration."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 6.0, color="blue")
+    make_clip(take_dir / "terminal.webm", 2.0, color="yellow")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(
+        take_dir,
+        tracks=[
+            {"name": "terminal", "video": take_dir / "terminal.webm", "offset": 0.0}
+        ],
+    )
+    assert ffprobe_duration(output) == pytest.approx(6.0, abs=0.5)
+    # Past the track's own 2.0s of real footage: still visible, via the
+    # frozen last frame tpad adds.
+    assert is_color(corner_pixel(output, 5.5, "bottom-left"), "yellow")
+
+
+def test_compose_with_a_track_shorter_than_a_segment_uses_tpad_to_freeze_the_tail(
+    tmp_path, monkeypatch
+):
+    """Structural companion to the real-ffmpeg test above: the filter graph
+    actually uses tpad=stop_mode=clone for the rest of the take, not just a
+    plain (too-short) trim. The track's own end (2.0s) is a segment
+    boundary, so its 2.0s of footage is one plain trim, and the [2.0, 6.0)
+    segment after it freezes its last 0.04s frame for the other 3.96s."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    (take_dir / "observer.webm").write_bytes(b"")
+    (take_dir / "terminal.webm").write_bytes(b"")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.save(take_dir / "timeline.json")
+
+    monkeypatch.setattr(
+        compose_module,
+        "ffprobe_duration",
+        lambda path: 6.0 if "observer" in str(path) else 2.0,
+    )
+    captured = {}
+
+    def fake_ffmpeg(*args, capture=True):
+        captured["args"] = args
+        Path(args[-1]).write_bytes(b"")
+
+    monkeypatch.setattr(compose_module, "ffmpeg", fake_ffmpeg)
+    compose(
+        take_dir,
+        tracks=[
+            {"name": "terminal", "video": take_dir / "terminal.webm", "offset": 0.0}
+        ],
+    )
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "[1:v]trim=start=0.000:end=2.000,setpts" in filter_complex
+    assert "tpad=stop_duration=3.960:stop_mode=clone" in filter_complex
+
+
+@requires_ffmpeg
+def test_compose_with_a_track_starting_after_the_observer_is_absent_before_its_offset(
+    tmp_path,
+):
+    """A track whose `offset` is positive (it starts recording partway
+    through the observer's own run) is composited only from the segment
+    that begins at or after its own offset onward -- never before."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 6.0, color="blue")
+    make_clip(take_dir / "terminal.webm", 3.0, color="magenta")
+
+    timeline = Timeline.new("observer.webm")
+    # A no-op focus event purely to force a segment boundary exactly at the
+    # track's own offset, so "before" and "after" land in distinct segments.
+    timeline.add_event(
+        {
+            "type": "focus",
+            "time": 3.0,
+            "view": "observer",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+        }
+    )
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(
+        take_dir,
+        tracks=[
+            {"name": "terminal", "video": take_dir / "terminal.webm", "offset": 3.0}
+        ],
+    )
+    assert ffprobe_duration(output) == pytest.approx(6.0, abs=0.5)
+    # Before the track's own offset: nothing to show.
+    assert not is_color(corner_pixel(output, 1.5, "bottom-left"), "magenta")
+    # From its offset onward: visible.
+    assert is_color(corner_pixel(output, 4.5, "bottom-left"), "magenta")
+
+
+@requires_ffmpeg
+def test_compose_with_two_simultaneous_tracks_in_different_corners(tmp_path):
+    """Two tracks in different corners compose independently, without
+    interfering with each other or with the existing actor/observer inset
+    (which keeps its own unchanged default corner, bottom-right)."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 6.0, color="blue")
+    make_clip(take_dir / "author.webm", 3.0, color="red")
+    make_clip(take_dir / "terminal.webm", 6.0, color="yellow")
+    make_clip(take_dir / "webcam.webm", 6.0, color="magenta")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_actor_clip("author", "author.webm", offset=1.0, duration=3.0)
+    timeline.add_event({"type": "turn_start", "time": 1.0, "actor": "author"})
+    timeline.add_event({"type": "turn_end", "time": 4.0, "actor": "author"})
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(
+        take_dir,
+        tracks=[
+            {
+                "name": "terminal",
+                "video": take_dir / "terminal.webm",
+                "offset": 0.0,
+                "corner": "bottom-left",
+            },
+            {
+                "name": "webcam",
+                "video": take_dir / "webcam.webm",
+                "offset": 0.0,
+                "corner": "top-right",
+            },
+        ],
+    )
+
+    # Mid-turn (output ~= raw time here, no chapters involved): actor is
+    # main (red), the existing actor/observer inset still defaults to
+    # bottom-right (blue, the observer), and both tracks show in their own,
+    # separate corners.
+    at = 2.5
+    assert is_color(corner_pixel(output, at, "bottom-right"), "blue")
+    assert is_color(corner_pixel(output, at, "bottom-left"), "yellow")
+    assert is_color(corner_pixel(output, at, "top-right"), "magenta")
+
+
+# -- Focusable tracks (Screencast.start_track()/end_track(), Focus(view=name)) --
+
+
+@requires_ffmpeg
+def test_focus_on_a_track_makes_it_main_with_observer_and_actor_as_pips(tmp_path):
+    """Unlike an external tracks=/--track entry (always a fixed-corner
+    inset, never main -- see the tests above), a track recorded on the
+    timeline itself (start_track()/end_track()) is eligible to become the
+    main view via Focus(view=<name>), with the observer and the active
+    actor turn demoted to its two PiPs."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 6.0, color="blue")
+    make_clip(take_dir / "author.webm", 3.0, color="red")
+    make_clip(take_dir / "terminal.webm", 6.0, color="yellow")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_actor_clip("author", "author.webm", offset=1.0, duration=3.0)
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.add_event({"type": "turn_start", "time": 1.0, "actor": "author"})
+    timeline.add_event(
+        {
+            "type": "focus",
+            "time": 2.0,
+            "view": "terminal",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+        }
+    )
+    timeline.add_event({"type": "turn_end", "time": 4.0, "actor": "author"})
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(take_dir)
+
+    # Before the focus flips: ordinary actor-main/observer-inset, exactly
+    # as a take with no tracks at all would compose.
+    assert is_color(corner_pixel(output, 1.5, "top-left", offset=0, size=20), "red")
+    assert is_color(corner_pixel(output, 1.5, "bottom-right"), "blue")
+
+    # After the focus flips: the track is main (its own color fills a
+    # corner nothing else uses), observer and the still-live actor turn
+    # are its two PiPs, in their documented corners.
+    assert is_color(corner_pixel(output, 3.0, "top-left", offset=0, size=20), "yellow")
+    assert is_color(corner_pixel(output, 3.0, "bottom-right"), "blue")
+    assert is_color(corner_pixel(output, 3.0, "bottom-left"), "red")
+
+
+@requires_ffmpeg
+def test_focus_on_a_track_outside_any_turn_shows_only_the_observer_pip(tmp_path):
+    """With no actor turn active, a track taking over as main has only the
+    observer as a PiP -- no second, empty inset rendered for a nonexistent
+    actor."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 4.0, color="blue")
+    make_clip(take_dir / "terminal.webm", 4.0, color="yellow")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.add_event(
+        {
+            "type": "focus",
+            "time": 1.0,
+            "view": "terminal",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+        }
+    )
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(take_dir)
+    assert is_color(corner_pixel(output, 2.0, "top-left", offset=0, size=20), "yellow")
+    assert is_color(corner_pixel(output, 2.0, "bottom-right"), "blue")
+    # No actor ever played a turn: nothing to show bottom-left.
+    assert not is_color(corner_pixel(output, 2.0, "bottom-left"), "red")
+
+
+@requires_ffmpeg
+def test_focus_on_a_track_opted_out_with_focusable_false_never_becomes_main(tmp_path):
+    """A track recorded with start_track(..., focusable=False) -- a
+    structural guarantee it stays a corner inset, e.g. a shell that should
+    never take over the full frame -- falls back to ordinary actor/observer
+    resolution exactly like an unknown track name (test_focus_on_an_unknown_
+    track_name_falls_back_to_ordinary_resolution's pure-function case),
+    while still rendering as its own always-present inset."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 4.0, color="blue")
+    make_clip(take_dir / "terminal.webm", 4.0, color="yellow")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0, focusable=False)
+    timeline.add_event(
+        {
+            "type": "focus",
+            "time": 1.0,
+            "view": "terminal",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+        }
+    )
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(take_dir)
+    # The focus event naming it is ignored for "main" purposes: falls back
+    # to the observer, not the track's own color, full-frame.
+    assert is_color(corner_pixel(output, 2.0, "top-left", offset=0, size=20), "blue")
+    # It is still composited -- just as its own corner inset, same as any
+    # other track, focusable or not.
+    assert is_color(corner_pixel(output, 2.0, "bottom-left"), "yellow")
+
+
+@requires_ffmpeg
+def test_focus_on_a_track_not_yet_available_falls_back_to_observer(tmp_path):
+    """(regression) A focusable, actually-recorded track used to become
+    main the instant a Focus(view=<name>) was in effect, with no check
+    that the track's own footage had started (or had already run out) by
+    that point -- see test_focus_on_a_track_not_yet_started_falls_back_to_
+    ordinary_resolution's pure-function case. This is the full-composer
+    counterpart: the track starts at offset=3.0 and runs 4s, so a take-wide
+    Focus(view=terminal) must still show the observer before it starts and
+    after it ends, and only the track's own color in between. Two
+    `recorded` holds (no synthetic freeze, no visible effect) force
+    boundaries at the track's own start/end -- otherwise one segment would
+    span the whole take and resolve _view_at() only once, at its midpoint,
+    masking the per-instant bug this guards against."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 8.0, color="blue")
+    make_clip(take_dir / "terminal.webm", 4.0, color="yellow")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=3.0)
+    timeline.add_event(
+        {
+            "type": "focus",
+            "time": 0.5,
+            "view": "terminal",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+        }
+    )
+    timeline.add_event({"type": "hold", "time": 3.0, "duration": 0.0, "recorded": True})
+    timeline.add_event({"type": "hold", "time": 7.0, "duration": 0.0, "recorded": True})
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(take_dir)
+    # Before the track starts: the focus event names it, but it isn't
+    # available yet -- falls back to the observer.
+    assert is_color(corner_pixel(output, 1.5, "top-left", offset=0, size=20), "blue")
+    # Once it has started (and not yet run out): the track takes over.
+    assert is_color(corner_pixel(output, 5.0, "top-left", offset=0, size=20), "yellow")
+    # After it has run out: back to the observer, not a frozen track frame.
+    assert is_color(corner_pixel(output, 7.5, "top-left", offset=0, size=20), "blue")
+
+
+@requires_ffmpeg
+def test_hold_freezes_the_tracks_own_frame_when_it_is_the_resolved_main_view(tmp_path):
+    """(regression) emit_holds_at() used to only recognize view == "actor",
+    falling through to frozen_observer_slice() for anything else -- so a
+    `hold` event with no explicit `view` (the ambient-resolution case a
+    hand-edited/pre-existing timeline can still produce, since hold.view
+    isn't required by the schema) while a track was the resolved main view
+    always froze the observer's frame instead of the track's own."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 6.0, color="blue")
+    make_clip(take_dir / "terminal.webm", 6.0, color="yellow")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.add_event(
+        {
+            "type": "focus",
+            "time": 1.0,
+            "view": "terminal",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+        }
+    )
+    # Written directly (not via the `Hold` keyword, which always sets
+    # "view") to exercise the ambient-fallback path deliberately.
+    timeline.add_event({"type": "hold", "time": 3.0, "duration": 2.0})
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(take_dir)
+    # The hold's own frozen segment occupies output time [3.0, 5.0) (no
+    # chapters/earlier holds shift it) -- full-frame, no inset, per
+    # emit_holds_at()'s own contract.
+    assert is_color(corner_pixel(output, 4.0, "top-left", offset=0, size=20), "yellow")
+
+
+def test_compose_rejects_a_track_name_shared_between_engine_and_external_tracks(
+    tmp_path, monkeypatch
+):
+    """(regression) An engine-recorded track (Start Track/End Track) and an
+    external tracks=/--track entry draw from two different namespaces --
+    Timeline.add_track_clip() only rejects a duplicate within the
+    engine-recorded set, since it has no idea what --track will be passed
+    at compose time. Without this check, a name collision between the two
+    would silently let one win in track_defs_by_name (Focus(view=name)
+    lookups) while the per-boundary inset loop still rendered *both* as
+    overlapping corner insets."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    (take_dir / "observer.webm").write_bytes(b"")
+    (take_dir / "terminal.webm").write_bytes(b"")
+    (take_dir / "other.webm").write_bytes(b"")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.save(take_dir / "timeline.json")
+
+    monkeypatch.setattr(compose_module, "ffprobe_duration", lambda path: 4.0)
+
+    with pytest.raises(ComposeError, match="terminal"):
+        compose(
+            take_dir,
+            tracks=[
+                {
+                    "name": "terminal",
+                    "video": str(take_dir / "other.webm"),
+                    "offset": 0.0,
+                }
+            ],
+        )
+
+
+@requires_ffmpeg
+def test_focus_solo_hides_every_inset_including_a_tracks(tmp_path):
+    """The case solo exists for: ending a take on the main view alone. A
+    gap after a turn would otherwise show the frozen actor as a
+    bottom-left PiP (see test_gap_after_a_turn_defaults_to_observer_with_
+    frozen_actor_inset's full-composer counterpart) and an always-present
+    track as its own corner inset (see the "Focusable tracks" tests above)
+    -- Focus(solo=True) turns both off at once, with no other way to do
+    that once a turn or a track has made an inset available."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 6.0, color="blue")
+    make_clip(take_dir / "author.webm", 3.0, color="red")
+    make_clip(take_dir / "terminal.webm", 6.0, color="yellow")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_actor_clip("author", "author.webm", offset=1.0, duration=3.0)
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.add_event({"type": "turn_start", "time": 1.0, "actor": "author"})
+    timeline.add_event({"type": "turn_end", "time": 4.0, "actor": "author"})
+    timeline.add_event(
+        {
+            "type": "focus",
+            "time": 4.5,
+            "view": "observer",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+            "solo": True,
+        }
+    )
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(take_dir)
+    # Before the solo focus: the ordinary gap-after-a-turn picture -- the
+    # frozen actor as a PiP, and the track in its own corner.
+    assert is_color(corner_pixel(output, 4.2, "bottom-right"), "red")
+    assert is_color(corner_pixel(output, 4.2, "bottom-left"), "yellow")
+    # After it: the observer alone, full-frame -- neither PiP renders.
+    assert not is_color(corner_pixel(output, 5.0, "bottom-right"), "red")
+    assert not is_color(corner_pixel(output, 5.0, "bottom-left"), "yellow")
+    assert is_color(corner_pixel(output, 5.0, "top-left", offset=0, size=20), "blue")
+
+
+def test_compose_fades_a_tracks_inset_only_when_fade_is_true(tmp_path, monkeypatch):
+    """Structural check of the filter graph: fade=True on a track clip adds
+    the format=yuva420p/geq alpha mask to its own inset's filter chain (see
+    pad_inset_faded); fade omitted (the default) uses the plain, opaque
+    pad_inset -- so an existing timeline/story gets no visual change at
+    all unless it opts in."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    (take_dir / "observer.webm").write_bytes(b"")
+    (take_dir / "terminal.webm").write_bytes(b"")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0, fade=True)
+    timeline.save(take_dir / "timeline.json")
+
+    monkeypatch.setattr(compose_module, "ffprobe_duration", lambda path: 4.0)
+    captured = {}
+
+    def fake_ffmpeg(*args, capture=True):
+        captured["args"] = args
+        Path(args[-1]).write_bytes(b"")
+
+    monkeypatch.setattr(compose_module, "ffmpeg", fake_ffmpeg)
+    compose(take_dir)
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "format=yuva420p" in filter_complex
+    assert "geq=lum=" in filter_complex
+
+
+def test_compose_does_not_fade_a_tracks_inset_by_default(tmp_path, monkeypatch):
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    (take_dir / "observer.webm").write_bytes(b"")
+    (take_dir / "terminal.webm").write_bytes(b"")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.save(take_dir / "timeline.json")
+
+    monkeypatch.setattr(compose_module, "ffprobe_duration", lambda path: 4.0)
+    captured = {}
+
+    def fake_ffmpeg(*args, capture=True):
+        captured["args"] = args
+        Path(args[-1]).write_bytes(b"")
+
+    monkeypatch.setattr(compose_module, "ffmpeg", fake_ffmpeg)
+    compose(take_dir)
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "format=yuva420p" not in filter_complex
+    assert "geq=" not in filter_complex
+
+
+def test_compose_uses_a_tracks_own_scale_override_in_its_inset_filter(
+    tmp_path, monkeypatch
+):
+    """An engine-recorded track's own scale/margin/border (schema defaults
+    0.4/24/3) override DEFAULT_SCALE/MARGIN/BORDER in its inset's own
+    pad_inset()/pad_inset_faded() call, the same way they already do for an
+    external tracks=/--track entry."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    (take_dir / "observer.webm").write_bytes(b"")
+    (take_dir / "terminal.webm").write_bytes(b"")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip(
+        "terminal", "terminal.webm", offset=0.0, scale=0.6, margin=12, border=5
+    )
+    timeline.save(take_dir / "timeline.json")
+
+    monkeypatch.setattr(compose_module, "ffprobe_duration", lambda path: 4.0)
+    captured = {}
+
+    def fake_ffmpeg(*args, capture=True):
+        captured["args"] = args
+        Path(args[-1]).write_bytes(b"")
+
+    monkeypatch.setattr(compose_module, "ffmpeg", fake_ffmpeg)
+    compose(take_dir)
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "scale=iw*0.6:-2" in filter_complex
+    assert "pad=iw+10:ih+10:5:5:color=0x1f2937" in filter_complex
+
+
+def test_compose_uses_default_scale_margin_border_when_a_track_omits_them(
+    tmp_path, monkeypatch
+):
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    (take_dir / "observer.webm").write_bytes(b"")
+    (take_dir / "terminal.webm").write_bytes(b"")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.save(take_dir / "timeline.json")
+
+    monkeypatch.setattr(compose_module, "ffprobe_duration", lambda path: 4.0)
+    captured = {}
+
+    def fake_ffmpeg(*args, capture=True):
+        captured["args"] = args
+        Path(args[-1]).write_bytes(b"")
+
+    monkeypatch.setattr(compose_module, "ffmpeg", fake_ffmpeg)
+    compose(take_dir)
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "scale=iw*0.4:-2" in filter_complex
+    assert "pad=iw+6:ih+6:3:3:color=0x1f2937" in filter_complex
+
+
+def test_compose_uses_default_bottom_left_corner_when_a_track_omits_it(
+    tmp_path, monkeypatch
+):
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    (take_dir / "observer.webm").write_bytes(b"")
+    (take_dir / "terminal.webm").write_bytes(b"")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.save(take_dir / "timeline.json")
+
+    monkeypatch.setattr(compose_module, "ffprobe_duration", lambda path: 4.0)
+    captured = {}
+
+    def fake_ffmpeg(*args, capture=True):
+        captured["args"] = args
+        Path(args[-1]).write_bytes(b"")
+
+    monkeypatch.setattr(compose_module, "ffmpeg", fake_ffmpeg)
+    compose(take_dir)
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "overlay=24:H-h-24[" in filter_complex
+
+
+def test_compose_uses_a_tracks_own_corner_override_in_its_overlay_position(
+    tmp_path, monkeypatch
+):
+    """An engine-recorded track's own `corner` (schema default bottom-left)
+    overrides it in the overlay position fed to overlay() -- previously
+    this was always hardcoded to bottom-left with no way to override it at
+    all, so two simultaneous tracks could never avoid colliding in the
+    same corner (see the pixel-level
+    test_compose_with_two_simultaneous_engine_tracks_in_different_corners
+    below)."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    (take_dir / "observer.webm").write_bytes(b"")
+    (take_dir / "terminal.webm").write_bytes(b"")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0, corner="top-right")
+    timeline.save(take_dir / "timeline.json")
+
+    monkeypatch.setattr(compose_module, "ffprobe_duration", lambda path: 4.0)
+    captured = {}
+
+    def fake_ffmpeg(*args, capture=True):
+        captured["args"] = args
+        Path(args[-1]).write_bytes(b"")
+
+    monkeypatch.setattr(compose_module, "ffmpeg", fake_ffmpeg)
+    compose(take_dir)
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "overlay=W-w-24:24[" in filter_complex
+
+
+@requires_ffmpeg
+def test_compose_with_two_simultaneous_engine_tracks_in_different_corners(tmp_path):
+    """Two engine-recorded tracks (Screencast.start_track()/end_track(), as
+    opposed to the external tracks=/--track entries covered by
+    test_compose_with_two_simultaneous_tracks_in_different_corners above)
+    compose independently in their own corners, without colliding, once
+    each has its own `corner` set."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 4.0, color="blue")
+    make_clip(take_dir / "terminal.webm", 4.0, color="yellow")
+    make_clip(take_dir / "webcam.webm", 4.0, color="magenta")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0)
+    timeline.add_track_clip("webcam", "webcam.webm", offset=0.0, corner="top-right")
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(take_dir)
+
+    at = 2.0
+    assert is_color(corner_pixel(output, at, "bottom-right"), "blue")
+    assert is_color(corner_pixel(output, at, "bottom-left"), "yellow")
+    assert is_color(corner_pixel(output, at, "top-right"), "magenta")
+
+
+def test_compose_warns_on_a_focus_event_naming_neither_a_view_nor_a_track(
+    tmp_path, monkeypatch
+):
+    """A Focus(view=...) typo used to fail loudly at record time (the old
+    enum check on 'actor'/'observer'); now that `view` also accepts a track
+    name, a typo instead silently falls back to ordinary actor/observer
+    resolution with nothing else in the pipeline ever flagging it -- warn
+    at compose time instead, since that is the first point every name the
+    take ever recorded (`track_defs_by_name`) is known."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    (take_dir / "observer.webm").write_bytes(b"")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_event({"type": "focus", "time": 0.0, "view": "oberver"})
+    timeline.save(take_dir / "timeline.json")
+
+    monkeypatch.setattr(compose_module, "ffprobe_duration", lambda path: 4.0)
+    monkeypatch.setattr(
+        compose_module,
+        "ffmpeg",
+        lambda *args, capture=True: Path(args[-1]).write_bytes(b""),
+    )
+
+    with pytest.warns(UserWarning, match="oberver"):
+        compose(take_dir)
+
+
+def test_compose_does_not_warn_on_a_focus_event_naming_a_real_track(
+    tmp_path, monkeypatch
+):
+    """Naming a track that was actually recorded -- even one opted out with
+    focusable=False, which also falls back to ordinary resolution -- is
+    the documented, deliberate case, not a typo, so it must not warn."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    (take_dir / "observer.webm").write_bytes(b"")
+    (take_dir / "terminal.webm").write_bytes(b"")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_track_clip("terminal", "terminal.webm", offset=0.0, focusable=False)
+    timeline.add_event({"type": "focus", "time": 0.0, "view": "terminal"})
+    timeline.save(take_dir / "timeline.json")
+
+    monkeypatch.setattr(compose_module, "ffprobe_duration", lambda path: 4.0)
+    monkeypatch.setattr(
+        compose_module,
+        "ffmpeg",
+        lambda *args, capture=True: Path(args[-1]).write_bytes(b""),
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        compose(take_dir)

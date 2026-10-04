@@ -20,6 +20,11 @@
       "items": { "$ref": "#/$defs/actorClip" },
       "description": "One entry per recorded actor turn, in chronological order."
     },
+    "tracks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/trackClip" },
+      "description": "Optional: extra contexts recorded for the whole take alongside the observer (Screencast.start_track()/end_track()), each independently focusable as the composer's main view via Focus(view=<name>) -- unlike compose()'s external tracks= (a secondary recording the engine itself never captured), always an always-present corner inset. Absent on a timeline written before this field existed."
+    },
     "events": {
       "type": "array",
       "items": { "$ref": "#/$defs/event" }
@@ -60,6 +65,59 @@
           "type": "number",
           "minimum": 0,
           "description": "Optional: the clip's measured duration in seconds (ffprobe). The composer re-measures this itself and does not trust a stale value here."
+        }
+      }
+    },
+    "trackClip": {
+      "type": "object",
+      "required": ["name", "video", "offset"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Matches a focus event's 'view' to make this track the main view -- see Focus(view=name)."
+        },
+        "video": {
+          "type": "string",
+          "description": "Path to the recorded .webm, relative to the take directory."
+        },
+        "offset": {
+          "type": "number",
+          "description": "Seconds from the observer recording's start to this track's start (context creation), measured with the same clock as the observer, i.e. time.monotonic() - started. Unlike an actor clip's offset, not constrained to be non-negative in principle, but start_track() always measures it against an already-running observer clock, so it never is in practice."
+        },
+        "focusable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether Focus(view=name) may make this track the composer's main view at all. Omitted (true) is the original behaviour. false is a structural guarantee that this track is always a corner inset and never main -- e.g. a terminal a story wants visible but never full-frame -- so a later edit of the story (or the timeline itself) cannot accidentally promote it by naming it in a focus event; the composer falls back to ordinary actor/observer resolution the same way it already does for an unknown track name."
+        },
+        "corner": {
+          "enum": ["bottom-left", "bottom-right", "top-left", "top-right"],
+          "default": "bottom-left",
+          "description": "Which corner this track's own always-present inset is pinned to. Defaults to bottom-left, the original (and only, before this field existed) behaviour -- same corner names compose()'s external tracks=/--track already accepts. Set it to avoid a collision when two or more tracks (or a track and a focus-demoted actor/observer inset) would otherwise land in the same corner at once."
+        },
+        "fade": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether this track's own corner inset fades out: its left third stays fully opaque and the remaining two-thirds fade to transparent on a logarithmic curve, letting the main view show through behind it. Independent of 'focusable' -- a track can fade while still being eligible to become main (the fade only ever applies to its inset rendering, never to a segment where it is main and rendered full-frame)."
+        },
+        "scale": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "default": 0.4,
+          "description": "This track's own inset scale, as a fraction of the main frame's width -- only ever affects its inset rendering, same as a focus event's own 'scale' affects the actor/observer inset (never a segment where this track is main and rendered full-frame, which always fills the whole frame regardless)."
+        },
+        "margin": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 24,
+          "description": "This track's own inset margin from its corner, in pixels."
+        },
+        "border": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3,
+          "description": "This track's own inset border width, in pixels."
         }
       }
     },
@@ -115,8 +173,9 @@
         "type": { "const": "focus" },
         "time": { "type": "number", "minimum": 0 },
         "view": {
-          "enum": ["actor", "observer"],
-          "description": "Which recording is the main (full-frame) view from this point on; the other becomes the inset."
+          "type": "string",
+          "minLength": 1,
+          "description": "Which recording is the main (full-frame) view from this point on; the others become insets. 'actor' and 'observer' are always recognized; any other value names a track opened with start_track() (see the top-level 'tracks' field) -- the composer falls back to 'observer' if it names a track that was not recorded or is not yet available at this point in the take."
         },
         "scale": {
           "type": "number",
@@ -126,7 +185,12 @@
           "description": "Inset scale, as a fraction of the main frame's width."
         },
         "margin": { "type": "integer", "minimum": 0, "default": 24 },
-        "border": { "type": "integer", "minimum": 0, "default": 3 }
+        "border": { "type": "integer", "minimum": 0, "default": 3 },
+        "solo": {
+          "type": "boolean",
+          "default": false,
+          "description": "true renders only 'view', full-frame, with no inset of any kind from this point on -- not the usual actor/observer cross-inset, and not any track's own always-present corner inset either. Stays in effect until the next focus event says otherwise. There is no other way to turn an inset back off once a turn or a track has made one available -- see compose._view_at's own docstring."
+        }
       }
     },
     "holdEvent": {

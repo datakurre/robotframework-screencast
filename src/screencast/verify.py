@@ -50,6 +50,7 @@ sheet to `contact-sheet.png` in the take directory.
 from pathlib import Path
 from screencast.compose import _inserted_holds
 from screencast.compose import _leading_shift
+from screencast.compose import _view_at
 from screencast.compose import ffprobe_duration
 from screencast.timeline import Timeline
 import json
@@ -308,10 +309,91 @@ def verify(take_dir, output_video=None, contact_sheet=None, rows=6, cols=5):
             }
         )
 
+    # A wait during which a track has real, independently live content on
+    # screen is not dead air -- a story opens a track (Screencast.
+    # start_track()/end_track()) specifically to put something real and
+    # changing on screen during a stretch where no actor/observer keyword
+    # is being driven (e.g. an ambient terminal's own scrolling output
+    # while an external task processes). Two ways that can be true:
+    #
+    # - the track is the main view at that instant (Focus(view=<name>) --
+    #   resolved the same way compose() itself decides what is on screen,
+    #   so this can never disagree with what the composed output actually
+    #   shows); or
+    # - the track is "only" a corner inset -- including one opted out of
+    #   ever becoming main with focusable=False, e.g. a shell that should
+    #   always stay a PiP -- but genuinely live (not yet started, or
+    #   already frozen on its own last frame) for the wait's entire span.
+    #   A track opted out of being *main* is not opted out of being *live*;
+    #   those are independent (see compose.py's own trackClip docstring).
+    #   Unless a `solo` focus is in effect: that hides every inset.
+    #
+    # See docs/verification.md's "Dead air" section.
+    turn_starts = sorted(timeline.events_of("turn_start"), key=lambda e: e["time"])
+    turn_ends = sorted(timeline.events_of("turn_end"), key=lambda e: e["time"])
+    turns = []
+    if len(turn_starts) == len(timeline.actors) and len(turn_ends) == len(
+        timeline.actors
+    ):
+        for turn_id, clip in enumerate(timeline.actors):
+            turns.append(
+                (
+                    turn_id,
+                    clip["actor"],
+                    turn_starts[turn_id]["time"],
+                    turn_ends[turn_id]["time"],
+                )
+            )
+    focus_events = timeline.events_of("focus")
+    track_clips = {t["name"]: t for t in timeline.tracks}
+    track_names = frozenset(
+        name for name, t in track_clips.items() if t.get("focusable", True)
+    )
+
+    # Probed lazily and memoized, not eagerly for every track up front: a
+    # take with no `wait` events at all (the only consumer, via
+    # _covered_by_a_track()) would otherwise pay for an ffprobe subprocess
+    # per track for nothing.
+    _track_duration_cache = {}
+
+    def _track_duration(name):
+        if name not in _track_duration_cache:
+            track = track_clips[name]
+            _track_duration_cache[name] = ffprobe_duration(take_dir / track["video"])
+        return _track_duration_cache[name]
+
+    def _track_is_live(t, name):
+        track = track_clips[name]
+        rel = t - track["offset"]
+        return 0.0 <= rel < _track_duration(name)
+
+    def _covered_by_a_track(wait):
+        if not track_clips:
+            return False
+        track_windows = {
+            name: (track_clips[name]["offset"], _track_duration(name))
+            for name in track_names
+        }
+        view, _turn, _scale, _margin, _border, solo = _view_at(
+            wait["time"], focus_events, turns, track_names, track_windows
+        )
+        if view.startswith("track:"):
+            return True
+        if solo:
+            # A solo focus renders the main view alone: no track inset is
+            # on screen to cover the wait, however live it is.
+            return False
+        wait_end = wait["time"] + wait["duration"]
+        return any(
+            _track_is_live(wait["time"], name) and _track_is_live(wait_end, name)
+            for name in track_clips
+        )
+
     waits = timeline.events_of("wait")
-    waited = sum(wait["duration"] for wait in waits)
-    longest_wait = max((wait["duration"] for wait in waits), default=0.0)
-    for wait in waits:
+    dead_air_waits = [w for w in waits if not _covered_by_a_track(w)]
+    waited = sum(wait["duration"] for wait in dead_air_waits)
+    longest_wait = max((wait["duration"] for wait in dead_air_waits), default=0.0)
+    for wait in dead_air_waits:
         if wait["duration"] > DEAD_AIR_MAX_WAIT:
             findings.append(
                 {
@@ -331,7 +413,7 @@ def verify(take_dir, output_video=None, contact_sheet=None, rows=6, cols=5):
                 "check": "dead_air",
                 "severity": "warning",
                 "message": (
-                    f"{waited:.1f}s spent waiting across {len(waits)} waits "
+                    f"{waited:.1f}s spent waiting across {len(dead_air_waits)} waits "
                     f"(warning above {DEAD_AIR_TOTAL_WAIT:g}s): the take "
                     "spends much of its length with nothing on screen"
                 ),

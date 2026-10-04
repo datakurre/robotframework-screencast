@@ -7,6 +7,37 @@ import argparse
 import sys
 
 
+def _parse_track(spec):
+    """Parse one `--track NAME:VIDEO:OFFSET[:CORNER[:SCALE]]` argument into
+    a dict `compose()`'s `tracks` parameter accepts. VIDEO must not itself
+    contain a `:` -- this is a simple positional split, not a shell-style
+    parser."""
+    parts = spec.split(":")
+    if len(parts) < 3 or len(parts) > 5:
+        raise argparse.ArgumentTypeError(
+            "Expected NAME:VIDEO:OFFSET[:CORNER[:SCALE]], got "
+            f"{spec!r} ({len(parts)} fields)"
+        )
+    name, video, offset, *rest = parts
+    try:
+        offset = float(offset)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"OFFSET must be a number, got {offset!r}"
+        ) from None
+    track = {"name": name, "video": video, "offset": offset}
+    if rest:
+        track["corner"] = rest[0]
+    if len(rest) > 1:
+        try:
+            track["scale"] = float(rest[1])
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"SCALE must be a number, got {rest[1]!r}"
+            ) from None
+    return track
+
+
 class _PrintVersions(argparse.Action):
     """`--version`: the resolved versions of Robot Framework, Playwright,
     jsonschema and ffmpeg. Computed only when asked for (it runs ffmpeg)."""
@@ -68,6 +99,22 @@ def main(argv=None):
     compose_parser = subparsers.add_parser("compose", help="Compose a take's timeline")
     compose_parser.add_argument("take")
     compose_parser.add_argument("--output", default=None)
+    compose_parser.add_argument(
+        "--track",
+        action="append",
+        type=_parse_track,
+        default=[],
+        dest="tracks",
+        metavar="NAME:VIDEO:OFFSET[:CORNER[:SCALE]]",
+        help="Composite an external PiP recording (e.g. a terminal) the "
+        "engine never recorded itself, as a corner inset on top of the "
+        "composed output. OFFSET is seconds on the observer's own clock "
+        "(when the track's own t=0 falls relative to Start Observer) -- "
+        "negative if the track started recording before Start Observer, "
+        "the common case for an ambient recording kicked off first. "
+        "CORNER is one of bottom-left (default), bottom-right, top-left, "
+        "top-right. Repeatable.",
+    )
 
     verify_parser = subparsers.add_parser("verify", help="Verify a composed take")
     verify_parser.add_argument("take")
@@ -127,7 +174,7 @@ def main(argv=None):
     if args.command == "compose":
         from screencast.compose import compose
 
-        path = compose(args.take, output=args.output)
+        path = compose(args.take, output=args.output, tracks=args.tracks or None)
         print(f"Wrote {path}")
         return 0
 

@@ -37,6 +37,60 @@ turn_start/turn_end/focus/chapter/hold event boundary:
 Inset scale/margin/border come from the focus event in effect (defaults:
 0.4, 24px margin, 3px border, from the timeline schema).
 
+## External PiP tracks (`tracks=`/`--track`)
+
+`compose()` takes an optional `tracks` list -- each a secondary recording the
+engine itself never captured (a `ttyd`-recorded terminal, say), composited as
+its own corner inset on top of everything the main per-boundary loop already
+produced. This is deliberately *not* part of `timeline.json`: the engine
+never manages recording a non-browser source, only (optionally) compositing
+it afterward, so a track is passed to `compose()`/`--track` at compose time,
+never stored.
+
+`offset` uses the exact same clock and sign convention as `actors[].offset`
+already does: the observer-clock instant at which the track's own t=0
+occurred (`rel_start = segment_start - offset`, same formula `turn_slice()`
+uses for an actor clip). An actor's own offset is always positive -- a turn
+can't start before `Start Observer` opens the context every turn is cut
+against. A track has no such constraint: the common case (an ambient
+terminal recording started moments *before* kicking off the whole take) has
+its own t=0 *before* `Start Observer`, which is a **negative** offset --
+e.g. a terminal recording that had already been running for 23.7s once
+`Start Observer` fires is `offset=-23.7`, not `+23.7`.
+
+The hook point is narrow and deliberate: only the main per-boundary loop's
+own segment label (the `label` the `if view == "actor": ... else: ...` block
+above builds) gets a track composited onto it. `emit_chapters_at()`'s and
+`emit_holds_at()`'s own segments are appended to `segment_labels` directly,
+never passing through that `label` -- so a track is automatically absent
+behind a title card or a synthetic hold freeze, with no `enable=` expression
+needed at all. Track visibility is resolved once per `[start, end)` boundary
+slice (in the timeline's raw observer-clock, the same clock a track's own
+`offset` is given in), not frame-by-frame -- which is exact, because every
+track's own start and end are themselves boundaries, so no segment ever
+straddles either.
+
+A track's own footage relative to one segment is one of three cases (see
+`track_slice()`):
+
+- it fully covers the segment: a plain trim, like `turn_slice()`.
+- it runs out partway through the segment, or has already finished before
+  the segment even starts: trim whatever is left, then freeze its last
+  frame (`tpad=stop_mode=clone`) for the remainder, like `frozen_turn_slice()`
+  -- chapters add real output duration with no corresponding external
+  footage, so a track recorded only for the live portions of a take runs out
+  long before a multi-chapter composed output does.
+- it has not started yet when the segment begins (its `offset` is still
+  ahead of the segment's own start): nothing to show. This composes nothing
+  for the track in that segment at all (as opposed to freezing a first
+  frame) -- chosen because "not recorded yet" reads more honestly than a
+  frozen frame implying something is already there.
+
+Multiple tracks compose independently, each layered onto the output of the
+previous one in the order given (track 1 onto main+inset, track 2 onto that,
+...) -- order only matters if corners overlap, which a sane set of tracks
+won't do.
+
 ## Rules carried over from the three e2e_*.py composers (see docs/AGENTS.md)
 
 - Never use `overlay=...:shortest=1` -- it truncates the output at the
@@ -51,6 +105,7 @@ from pathlib import Path
 from screencast.timeline import OVERLAP_TOLERANCE
 from screencast.timeline import Timeline
 import subprocess
+import warnings
 
 
 DEFAULT_SCALE = 0.4
@@ -165,12 +220,35 @@ class ComposeError(ValueError):
     pass
 
 
-def _view_at(t, focus_events, turns, tolerance=1e-6):
-    """Resolve (kind, turn_id_or_None, scale, margin, border) in effect at
-    time `t`. `turns` is a list of (turn_id, actor, start, end) sorted by
-    start -- keyed by `turn_id` (a clip, i.e. one turn), not by `actor`
-    name, since one actor can play more than one turn (e.g. "reception" in
-    contact_form.robot has three) and two turns never share a clip."""
+def _build_track_def(name, path, offset, duration, input_index, focusable, source):
+    """Build one `track_defs` entry, shared by compose()'s two track
+    sources (`timeline.tracks` and the external `tracks=`/`--track`
+    parameter) -- they differ only in `path` resolution, the `name`
+    fallback, and whether `focusable` ever varies (engine tracks honor
+    their own recorded flag; an external track is never focusable), never
+    in the inset-styling defaults below."""
+    return {
+        "name": name,
+        "path": path,
+        "offset": float(offset),
+        "duration": duration,
+        "corner": source.get("corner", "bottom-left"),
+        "scale": source.get("scale", DEFAULT_SCALE),
+        "margin": source.get("margin", DEFAULT_MARGIN),
+        "border": source.get("border", DEFAULT_BORDER),
+        "focusable": focusable,
+        "fade": source.get("fade", False),
+        "input_index": input_index,
+    }
+
+
+def _turn_window(t, turns, tolerance=1e-6):
+    """(active_turn, most_recent_turn), each `(turn_id, actor, start, end)`
+    or None -- the turn covering `t` right now, and the most recent one
+    that had started by `t` (possibly the same one). Shared by `_view_at`
+    (to scope which focus events apply) and by the composer's own
+    per-segment loop (to know whether an actor PiP is available at all,
+    independent of what the current focus happens to be)."""
     active_turn = None
     most_recent_turn = None
     for turn_id, actor, start, end in turns:
@@ -178,6 +256,54 @@ def _view_at(t, focus_events, turns, tolerance=1e-6):
             active_turn = (turn_id, actor, start, end)
         if start <= t + tolerance:
             most_recent_turn = (turn_id, actor, start, end)
+    return active_turn, most_recent_turn
+
+
+def _view_at(
+    t, focus_events, turns, track_names=frozenset(), track_windows=None, tolerance=1e-6
+):
+    """Resolve (kind, turn_id_or_None, scale, margin, border, solo) in
+    effect at time `t`. `turns` is a list of (turn_id, actor, start, end)
+    sorted by start -- keyed by `turn_id` (a clip, i.e. one turn), not by
+    `actor` name, since one actor can play more than one turn (e.g.
+    "reception" in contact_form.robot has three) and two turns never share
+    a clip.
+
+    `kind` is `"actor"`, `"observer"`, or `f"track:{name}"` for a name in
+    `track_names` (a track opened with `Screencast.start_track()` -- see
+    its own docstring) -- the segment loop renders that track full-frame as
+    the main view instead of the observer or the active actor. A focus
+    event naming anything else (an unrecorded, opted-out, or -- see
+    `track_windows` below -- not-yet-available/already-finished track)
+    falls through to the ordinary actor/observer resolution below, the same
+    safety net `view == "actor"` with no active turn already relies on.
+
+    `track_windows`, when given, maps a name in `track_names` to its own
+    `(offset, duration)` -- the same window `track_slice()` trims against.
+    A name only resolves to `f"track:{name}"` when `t` actually falls
+    inside that window (`offset <= t < offset + duration`); a focus event
+    naming a track that has not started yet, or has already run out, falls
+    through to ordinary resolution instead, exactly as the timeline
+    schema's own `focusEvent.view` description promises ("the composer
+    falls back to 'observer' ... not yet available at this point in the
+    take") -- matching the per-segment inset loop's own `start <
+    track["offset"]` guard, which already skips an unavailable track's
+    inset for the same reason. `None` (the default, and what every caller
+    that only cares about name resolution -- e.g. the pure `_view_at` unit
+    tests -- passes) skips this check entirely: a name in `track_names`
+    always resolves, as if permanently available.
+
+    `solo` (a focus event's own optional `solo`, default False) tells the
+    segment loop to render only `kind`, full-frame, with no inset of any
+    kind -- not the usual actor/observer cross-inset, and not any track's
+    own always-present corner inset either. For a take whose last stretch
+    is meant to end on the main view alone (e.g. mirroring a trailing
+    `Hold`, which already never renders an inset -- see `emit_holds_at()`),
+    this is the only way to turn insets off again once something (a turn, a
+    track) has made one available; nothing else in the timeline vocabulary
+    can undo that."""
+    active_turn, most_recent_turn = _turn_window(t, turns, tolerance)
+    inset_turn_id = (active_turn or most_recent_turn or (None,))[0]
 
     # The most recent focus event at or before `t`, scoped to the active
     # turn's own window when inside one (a focus event from a previous
@@ -188,10 +314,34 @@ def _view_at(t, focus_events, turns, tolerance=1e-6):
         if event["time"] <= t + tolerance and event["time"] >= scope_start - tolerance:
             latest_focus = event
 
+    if latest_focus is not None:
+        requested = latest_focus["view"]
+        if requested not in ("actor", "observer") and requested in track_names:
+            window = track_windows.get(requested) if track_windows else None
+            available = window is None or (
+                window[0] - tolerance <= t < window[0] + window[1] + tolerance
+            )
+            if available:
+                return (
+                    f"track:{requested}",
+                    inset_turn_id,
+                    latest_focus.get("scale", DEFAULT_SCALE),
+                    latest_focus.get("margin", DEFAULT_MARGIN),
+                    latest_focus.get("border", DEFAULT_BORDER),
+                    bool(latest_focus.get("solo", False)),
+                )
+
     if active_turn:
         turn_id = active_turn[0]
         if latest_focus is None:
-            return ("actor", turn_id, DEFAULT_SCALE, DEFAULT_MARGIN, DEFAULT_BORDER)
+            return (
+                "actor",
+                turn_id,
+                DEFAULT_SCALE,
+                DEFAULT_MARGIN,
+                DEFAULT_BORDER,
+                False,
+            )
         if latest_focus["view"] == "actor":
             return (
                 "actor",
@@ -199,6 +349,7 @@ def _view_at(t, focus_events, turns, tolerance=1e-6):
                 latest_focus.get("scale", DEFAULT_SCALE),
                 latest_focus.get("margin", DEFAULT_MARGIN),
                 latest_focus.get("border", DEFAULT_BORDER),
+                bool(latest_focus.get("solo", False)),
             )
         return (
             "observer",
@@ -206,6 +357,7 @@ def _view_at(t, focus_events, turns, tolerance=1e-6):
             latest_focus.get("scale", DEFAULT_SCALE),
             latest_focus.get("margin", DEFAULT_MARGIN),
             latest_focus.get("border", DEFAULT_BORDER),
+            bool(latest_focus.get("solo", False)),
         )
 
     # A gap: no active turn.
@@ -217,6 +369,7 @@ def _view_at(t, focus_events, turns, tolerance=1e-6):
             DEFAULT_SCALE,
             DEFAULT_MARGIN,
             DEFAULT_BORDER,
+            False,
         )
     view = "actor" if latest_focus["view"] == "actor" else "observer"
     if view == "actor" and inset_turn_id is None:
@@ -227,6 +380,7 @@ def _view_at(t, focus_events, turns, tolerance=1e-6):
         latest_focus.get("scale", DEFAULT_SCALE),
         latest_focus.get("margin", DEFAULT_MARGIN),
         latest_focus.get("border", DEFAULT_BORDER),
+        bool(latest_focus.get("solo", False)),
     )
 
 
@@ -340,7 +494,7 @@ def write_captions_vtt(
     return vtt_path
 
 
-def compose(take_dir, output=None):
+def compose(take_dir, output=None, tracks=None):
     take_dir = Path(take_dir)
     timeline = Timeline.load(take_dir / "timeline.json")
 
@@ -438,17 +592,6 @@ def compose(take_dir, output=None):
     # raw rendering before it without skipping anything that was recorded.
     shift = _leading_shift(chapter_events, [t[2] for t in turns])
 
-    boundaries = {0.0, observer_duration}
-    for _turn_id, _actor, start, end in turns:
-        boundaries.add(start)
-        boundaries.add(end)
-    for event in focus_events + chapter_events + hold_events:
-        boundaries.add(event["time"])
-    # Everything before a leading first chapter is dropped (see `shift`
-    # above) -- every boundary inside the lead-in, not only 0.0, or the
-    # segments between them would still render it.
-    boundaries = sorted(b for b in boundaries if b >= shift - 1e-6)
-
     output = Path(output) if output else take_dir / "output.webm"
     title_dir = take_dir / "titles"
 
@@ -459,6 +602,128 @@ def compose(take_dir, output=None):
     for turn_id, clip in enumerate(clips):
         input_index_by_turn[turn_id] = len(inputs) // 2
         inputs += ["-i", str(clip["path"])]
+
+    # Tracks -- added as inputs right after the actor clips, before any
+    # title card input is added lazily below, so their input indices never
+    # shift once fixed here. Two sources, merged into one `track_defs` list:
+    # engine-recorded tracks from the timeline itself (`Screencast.
+    # start_track()`/`end_track()` -- see their own docstrings), always
+    # `focusable` (eligible to become the segment loop's main view, not
+    # just an always-present inset); and the external `tracks=`/`--track`
+    # parameter below (see the module docstring's "External PiP tracks"
+    # section) for a recording the engine itself never captured -- always a
+    # fixed-corner inset, never focusable, exactly as before this existed.
+    track_defs = []
+    for track in timeline.tracks:
+        path = take_dir / track["video"]
+        duration = ffprobe_duration(path)
+        input_index = len(inputs) // 2
+        inputs += ["-i", str(path)]
+        track_defs.append(
+            _build_track_def(
+                track["name"],
+                path,
+                track["offset"],
+                duration,
+                input_index,
+                track.get("focusable", True),
+                track,
+            )
+        )
+    for track in tracks or []:
+        path = Path(track["video"])
+        duration = ffprobe_duration(path)
+        input_index = len(inputs) // 2
+        inputs += ["-i", str(path)]
+        track_defs.append(
+            _build_track_def(
+                track.get("name", path.stem),
+                path,
+                track["offset"],
+                duration,
+                input_index,
+                False,
+                track,
+            )
+        )
+
+    # An engine-recorded track (Start Track/End Track) and an external
+    # tracks=/--track entry drawing from two different namespaces would
+    # otherwise be free to collide on the same name -- Timeline.
+    # add_track_clip() only rejects a duplicate *within* the engine-recorded
+    # set, since it has no idea what --track will be passed at compose time.
+    # Both track_names (focus resolution) and the per-boundary inset loop
+    # below key a track by name alone, so a collision would silently let one
+    # win in Focus(view=name) lookups while the inset loop still rendered
+    # *both* on top of each other -- fail loudly instead.
+    seen_names = set()
+    for track in track_defs:
+        if track["name"] in seen_names:
+            raise ComposeError(
+                f"Track name {track['name']!r} is used by more than one track "
+                "(an engine-recorded Start Track and/or an external "
+                "tracks=/--track entry) -- track names must be unique across "
+                "both sources."
+            )
+        seen_names.add(track["name"])
+
+    # Names of *focusable* tracks only (engine-recorded via start_track()/
+    # end_track(), and not opted out with focusable=False -- e.g. a shell
+    # that should always stay a corner inset and never take over the main
+    # view) -- an external tracks=/--track entry is never eligible to
+    # become the main view either, so it is never in this set. A focus
+    # event naming anything not in this set falls through to ordinary
+    # actor/observer resolution (see _view_at's own docstring).
+    track_names = frozenset(t["name"] for t in track_defs if t["focusable"])
+    track_defs_by_name = {t["name"]: t for t in track_defs}
+    track_windows = {
+        name: (track_defs_by_name[name]["offset"], track_defs_by_name[name]["duration"])
+        for name in track_names
+    }
+
+    # A focus event's view naming neither "actor"/"observer" nor any track
+    # ever recorded on this timeline (focusable or not) cannot be the
+    # documented "closed earlier"/"not opened yet"/"opted out with
+    # focusable=False" cases -- those all name a track that *is* in
+    # track_defs_by_name. It can only be a typo (or a name that was never
+    # Start Track'd at all), silently falling back to ordinary resolution
+    # with nothing else in the pipeline ever surfacing the mistake -- warn
+    # here instead of failing the whole compose, since the documented
+    # fallback itself is deliberate and must still work for the legitimate
+    # cases above.
+    for event in focus_events:
+        requested = event["view"]
+        if requested in ("actor", "observer") or requested in track_defs_by_name:
+            continue
+        warnings.warn(
+            f"Focus(view={requested!r}) at {event['time']:.3f}s matches "
+            "neither 'actor'/'observer' nor any track recorded on this "
+            "timeline -- falling back to ordinary actor/observer "
+            "resolution. If this name was meant to match a track, check "
+            "it against Start Track for a typo.",
+            stacklevel=2,
+        )
+
+    boundaries = {0.0, observer_duration}
+    for _turn_id, _actor, start, end in turns:
+        boundaries.add(start)
+        boundaries.add(end)
+    for event in focus_events + chapter_events + hold_events:
+        boundaries.add(event["time"])
+    # A track's own start and end are cut points too: _view_at() resolves a
+    # whole segment from its midpoint, and the inset loop below decides
+    # whether a track has started from the segment's start -- without these,
+    # a track starting or running out mid-segment would be promoted (or
+    # shown as an inset) with footage from before its own t=0, out of sync.
+    for track in track_defs:
+        for edge in (track["offset"], track["offset"] + track["duration"]):
+            if 0.0 < edge < observer_duration:
+                boundaries.add(edge)
+    # Everything before a leading first chapter is dropped (see `shift`
+    # above) -- every boundary inside the lead-in, not only 0.0, or the
+    # segments between them would still render it.
+    boundaries = sorted(b for b in boundaries if b >= shift - 1e-6)
+
     title_inputs = {}  # cache key -> input index
 
     # Normalize every slice to VIDEO_SIZE: concat requires every segment to
@@ -510,8 +775,101 @@ def compose(take_dir, output=None):
             f"{border}:color={DEFAULT_BORDER_COLOR}[{dst}]"
         )
 
-    def overlay(main, inset, margin, dst):
-        filters.append(f"[{main}][{inset}]overlay=W-w-{margin}:H-h-{margin}[{dst}]")
+    def pad_inset_faded(src, dst, scale, border=DEFAULT_BORDER):
+        """Like pad_inset(), but the inset's own left third stays fully
+        opaque and its trailing two-thirds fade to transparent on a
+        logarithmic curve (the standard audio fade-out shape: steep at
+        first, easing out towards zero) -- for a track PiP that is always
+        on screen (never promoted to main), this keeps its most legible,
+        left-aligned content readable while letting more of the main view
+        show through behind the rest of the box."""
+        filters.append(
+            f"[{src}]scale=iw*{scale}:-2,"
+            f"pad=iw+{2 * border}:ih+{2 * border}:{border}:"
+            f"{border}:color={DEFAULT_BORDER_COLOR},format=yuva420p,"
+            "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':"
+            "a='if(lt(X,W/3),255,"
+            "255*(1-log(1+9*(X-W/3)/(2*W/3))/log(10)))'"
+            f"[{dst}]"
+        )
+
+    _CORNER_POSITIONS = {
+        "bottom-right": "W-w-{m}:H-h-{m}",
+        "bottom-left": "{m}:H-h-{m}",
+        "top-right": "W-w-{m}:{m}",
+        "top-left": "{m}:{m}",
+    }
+
+    def overlay(main, inset, margin, dst, corner="bottom-right"):
+        try:
+            position = _CORNER_POSITIONS[corner]
+        except KeyError:
+            raise ComposeError(
+                f"Unknown corner {corner!r} -- expected one of "
+                f"{sorted(_CORNER_POSITIONS)}"
+            ) from None
+        filters.append(f"[{main}][{inset}]overlay={position.format(m=margin)}[{dst}]")
+
+    def track_slice(label, track, start, end):
+        """Analogous to turn_slice()/frozen_turn_slice(), but for an
+        external track whose own duration has no relationship to the
+        take's own boundaries. Only called for a segment at or after
+        `track["offset"]`: a track's offset is itself a boundary, and both
+        callers (the inset loop's own `start < offset` skip, and
+        `_view_at()`'s `track_windows` check for the main view) leave out
+        a segment before it -- so `rel_start` here is never negative."""
+        index = track["input_index"]
+        rel_start = max(0.0, start - track["offset"])
+        rel_end = end - track["offset"]
+        total = end - start
+        if rel_start >= track["duration"] - 1e-6:
+            # Already finished before this segment even starts: freeze its
+            # very last frame for the whole segment, same technique as
+            # frozen_turn_slice()'s fixed ~1-frame freeze window.
+            freeze_at = max(0.0, track["duration"] - 0.04)
+            filters.append(
+                f"[{index}:v]trim=start={freeze_at:.3f}:end={freeze_at + 0.04:.3f},"
+                f"setpts=PTS-STARTPTS,{scale_to_size},"
+                f"tpad=stop_duration={max(total - 0.04, 0.001):.3f}:"
+                f"stop_mode=clone,fps={FPS}[{label}]"
+            )
+            return
+        avail_end = min(rel_end, track["duration"])
+        trim_end = max(rel_start + 0.001, avail_end)
+        covered = trim_end - rel_start
+        freeze_duration = max(0.0, total - covered)
+        if freeze_duration <= 1e-6:
+            # Fully covers the segment: plain trim.
+            filters.append(
+                f"[{index}:v]trim=start={rel_start:.3f}:end={trim_end:.3f},"
+                f"setpts=PTS-STARTPTS,{scale_to_size},fps={FPS}[{label}]"
+            )
+        else:
+            # Runs out partway through the segment: trim what's available,
+            # then freeze its last frame for the remainder.
+            filters.append(
+                f"[{index}:v]trim=start={rel_start:.3f}:end={trim_end:.3f},"
+                f"setpts=PTS-STARTPTS,{scale_to_size},"
+                f"tpad=stop_duration={freeze_duration:.3f}:stop_mode=clone,"
+                f"fps={FPS}[{label}]"
+            )
+
+    def frozen_track_slice(label, track, at, duration):
+        """Analogous to frozen_turn_slice(), but freezing a track's own
+        frame instead of an actor's -- used by emit_holds_at() when a
+        `hold` event's effective view is a track (see its own call site):
+        `_view_at()` only ever resolves to `f"track:{name}"` when the track
+        is actually available at `at` (see `_view_at`'s own `track_windows`
+        docstring), so `freeze_at` here is never negative before the
+        `max(0.0, ...)` clamp -- kept anyway, same defensive style
+        frozen_turn_slice() already uses for its own always-live turn_id."""
+        index = track["input_index"]
+        freeze_at = max(0.0, min(track["duration"] - 0.04, at - track["offset"]))
+        filters.append(
+            f"[{index}:v]trim=start={freeze_at:.3f}:end={freeze_at + 0.04:.3f},"
+            f"setpts=PTS-STARTPTS,{scale_to_size},tpad=stop_duration={duration:.3f}:"
+            f"stop_mode=clone,fps={FPS}[{label}]"
+        )
 
     counter = [0]
 
@@ -548,12 +906,25 @@ def compose(take_dir, output=None):
                 # already ordinary observer footage the boundary loop below
                 # renders on its own; a segment emitted here would double it.
                 continue
-            view, inset_turn_id, _scale, _margin, _border = _view_at(
-                max(0.0, t - 1e-6), focus_events, turns
+            view, inset_turn_id, _scale, _margin, _border, _solo = _view_at(
+                max(0.0, t - 1e-6), focus_events, turns, track_names, track_windows
             )
             main_label = next_label("holdmain")
-            if hold.get("view", view) == "actor" and inset_turn_id is not None:
+            # hold.get("view", view) falls back to the ambient resolved
+            # `view` only when the event itself has no "view" key at all
+            # (a hand-edited/pre-existing timeline -- the `Hold` keyword
+            # always writes one) -- the schema restricts an explicit
+            # "view" to "actor"/"observer", so a "track:<name>" result here
+            # can only come from that fallback, never from an explicit
+            # value, and only when _view_at() just confirmed the track is
+            # actually available at `t` (see its own track_windows
+            # docstring).
+            resolved = hold.get("view", view)
+            if resolved == "actor" and inset_turn_id is not None:
                 frozen_turn_slice(main_label, inset_turn_id, t, hold["duration"])
+            elif resolved.startswith("track:"):
+                track = track_defs_by_name[resolved[len("track:") :]]
+                frozen_track_slice(main_label, track, t, hold["duration"])
             else:
                 frozen_observer_slice(main_label, t, hold["duration"])
             segment_labels.append(main_label)
@@ -566,11 +937,50 @@ def compose(take_dir, output=None):
         emit_chapters_at(start)
         emit_holds_at(start)
 
-        view, inset_turn_id, scale, margin, border = _view_at(
-            (start + end) / 2, focus_events, turns
+        view, inset_turn_id, scale, margin, border, solo = _view_at(
+            (start + end) / 2, focus_events, turns, track_names, track_windows
         )
         label = next_label("seg")
-        if view == "actor":
+        main_track_name = view[len("track:") :] if view.startswith("track:") else None
+        if main_track_name is not None:
+            main_track = track_defs_by_name[main_track_name]
+            main_label = next_label("main")
+            track_slice(main_label, main_track, start, end)
+            label = main_label
+
+            if not solo:
+                # Observer: always available (the whole-take recording) as
+                # a PiP -- bottom-right matches the engine's own single-PiP
+                # default corner, so a take with only one other screen
+                # actually showing at a given moment still reads the same
+                # way a classic 2-screen (observer+actor) take always has.
+                observer_raw = next_label("inset")
+                observer_slice(observer_raw, start, end)
+                observer_padded = next_label("inset")
+                pad_inset(observer_raw, observer_padded, scale, border)
+                combined = next_label("seg")
+                overlay(label, observer_padded, margin, combined, "bottom-right")
+                label = combined
+
+                # Actor: a second PiP, bottom-left, only when a turn is live
+                # or was left live-focused into a gap -- same availability
+                # rule (and live-vs-frozen choice) the observer-main branch
+                # below already applies to its own actor inset.
+                if inset_turn_id is not None:
+                    actor_raw = next_label("inset")
+                    _turn_start, turn_end = turns_by_id[inset_turn_id]
+                    if end <= turn_end + 1e-6:
+                        turn_slice(actor_raw, inset_turn_id, start, end)
+                    else:
+                        frozen_turn_slice(
+                            actor_raw, inset_turn_id, turn_end, end - start
+                        )
+                    actor_padded = next_label("inset")
+                    pad_inset(actor_raw, actor_padded, scale, border)
+                    combined2 = next_label("seg")
+                    overlay(label, actor_padded, margin, combined2, "bottom-left")
+                    label = combined2
+        elif view == "actor":
             main_label = next_label("main")
             _turn_start, turn_end = turns_by_id[inset_turn_id]
             if end <= turn_end + 1e-6:
@@ -587,14 +997,17 @@ def compose(take_dir, output=None):
                 # near-zero-length segment -- exactly the inset branch below
                 # already guards against with this same turn_end clamp.
                 frozen_turn_slice(main_label, inset_turn_id, turn_end, end - start)
-            inset_label = next_label("inset")
-            observer_slice(f"{inset_label}raw", start, end)
-            pad_inset(f"{inset_label}raw", inset_label, scale, border)
-            overlay(main_label, inset_label, margin, label)
+            if solo:
+                filters.append(f"[{main_label}]null[{label}]")
+            else:
+                inset_label = next_label("inset")
+                observer_slice(f"{inset_label}raw", start, end)
+                pad_inset(f"{inset_label}raw", inset_label, scale, border)
+                overlay(main_label, inset_label, margin, label)
         else:
             main_label = next_label("main")
             observer_slice(main_label, start, end)
-            if inset_turn_id is None:
+            if solo or inset_turn_id is None:
                 filters.append(f"[{main_label}]null[{label}]")
             else:
                 inset_label = next_label("inset")
@@ -609,6 +1022,29 @@ def compose(take_dir, output=None):
                     )
                 pad_inset(f"{inset_label}raw", inset_label, scale, border)
                 overlay(main_label, inset_label, margin, label)
+
+        # External PiP tracks: composited only onto this live segment's own
+        # `label`, never onto a chapter/hold segment (those are appended to
+        # segment_labels directly, above/below this loop, and never reach
+        # here) -- see the module docstring's "External PiP tracks" section
+        # for why that is exactly what makes a track vanish behind a title
+        # card for free. Each track layers onto the previous one's result.
+        # `solo` turns this off too -- a solo segment shows only `label`,
+        # no inset of any kind, track or otherwise.
+        for track in [] if solo else track_defs:
+            if track["name"] == main_track_name:
+                continue  # already rendered full-frame as the main view above
+            if start < track["offset"] - 1e-6:
+                continue  # hasn't started yet: nothing to show for it here
+            track_raw = next_label("trackraw")
+            track_slice(track_raw, track, start, end)
+            track_padded = next_label("trackpad")
+            pad_fn = pad_inset_faded if track["fade"] else pad_inset
+            pad_fn(track_raw, track_padded, track["scale"], track["border"])
+            combined = next_label("seg")
+            overlay(label, track_padded, track["margin"], combined, track["corner"])
+            label = combined
+
         segment_labels.append(label)
 
     # A chapter/hold clamped onto the final boundary (observer_duration) is

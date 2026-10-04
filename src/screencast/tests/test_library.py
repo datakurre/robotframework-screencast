@@ -372,11 +372,40 @@ def test_chapter_focus_hold_add_timeline_events_without_waiting(tmp_path):
     assert timeline.events_of("hold")[0]["duration"] == 10.0
 
 
-def test_focus_rejects_unknown_view(tmp_path):
+def test_focus_rejects_an_empty_view(tmp_path):
     screencast = library_module.Screencast(take_dir=tmp_path)
     screencast.start_observer("cockpit", "http://example.test/cockpit")
     with pytest.raises(FatalError):
-        screencast.focus("sideways")
+        screencast.focus("")
+
+
+def test_focus_accepts_a_track_name_not_just_actor_or_observer(tmp_path):
+    """`view` can name a track opened with `Start Track` -- the composer,
+    not this keyword, is what resolves it (falling back to 'observer' if
+    the name turns out not to be a real/available track at compose time --
+    see compose._view_at), so this does not validate it against
+    `_SESSION.tracks` here. Any non-empty name is accepted."""
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.focus("terminal")
+    event = library_module._SESSION.timeline.events_of("focus")[-1]
+    assert event["view"] == "terminal"
+
+
+def test_focus_defaults_to_solo_false(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.focus("observer")
+    event = library_module._SESSION.timeline.events_of("focus")[-1]
+    assert event["solo"] is False
+
+
+def test_focus_records_solo_true(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.focus("observer", solo=True)
+    event = library_module._SESSION.timeline.events_of("focus")[-1]
+    assert event["solo"] is True
 
 
 def test_browser_is_reused_across_repeated_instantiation(tmp_path):
@@ -408,6 +437,189 @@ def test_end_observer_without_start_raises(tmp_path):
     screencast = library_module.Screencast(take_dir=tmp_path)
     with pytest.raises(FatalError):
         screencast.end_observer()
+
+
+def test_start_track_requires_an_observer_first(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    with pytest.raises(FatalError):
+        screencast.start_track("terminal", "http://example.test/terminal")
+
+
+def test_track_records_its_own_clip_on_the_timeline_with_a_positive_offset(
+    tmp_path, monkeypatch
+):
+    clock = {"t": 100.0}
+    monkeypatch.setattr(library_module.time, "monotonic", lambda: clock["t"])
+
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    clock["t"] += 5.0  # the track starts 5s into the take
+    screencast.start_track("terminal", "http://example.test/terminal")
+    clock["t"] += 10.0
+    screencast.end_track("terminal")
+
+    tracks = library_module._SESSION.timeline.tracks
+    assert len(tracks) == 1
+    assert tracks[0]["name"] == "terminal"
+    assert tracks[0]["offset"] == pytest.approx(5.0)
+
+
+def test_track_records_focusable_false_and_fade_true_on_the_timeline(tmp_path):
+    """start_track()'s own focusable/fade kwargs reach the timeline clip
+    end_track() writes, unchanged -- the same values add_track_clip()
+    itself is unit-tested to store (see test_timeline.py)."""
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.start_track(
+        "terminal", "http://example.test/terminal", focusable=False, fade=True
+    )
+    screencast.end_track("terminal")
+
+    clip = library_module._SESSION.timeline.tracks[0]
+    assert clip["focusable"] is False
+    assert clip["fade"] is True
+
+
+def test_track_defaults_omit_focusable_and_fade_on_the_timeline(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.start_track("terminal", "http://example.test/terminal")
+    screencast.end_track("terminal")
+
+    clip = library_module._SESSION.timeline.tracks[0]
+    assert "focusable" not in clip
+    assert "fade" not in clip
+    assert "scale" not in clip
+    assert "margin" not in clip
+    assert "border" not in clip
+
+
+def test_track_records_an_explicit_scale_margin_and_border_on_the_timeline(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.start_track(
+        "terminal", "http://example.test/terminal", scale=0.6, margin=12, border=5
+    )
+    screencast.end_track("terminal")
+
+    clip = library_module._SESSION.timeline.tracks[0]
+    assert clip["scale"] == 0.6
+    assert clip["margin"] == 12
+    assert clip["border"] == 5
+
+
+def test_track_records_an_explicit_corner_on_the_timeline(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.start_track(
+        "terminal", "http://example.test/terminal", corner="top-left"
+    )
+    screencast.end_track("terminal")
+
+    clip = library_module._SESSION.timeline.tracks[0]
+    assert clip["corner"] == "top-left"
+
+
+def test_track_defaults_omit_corner_on_the_timeline(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.start_track("terminal", "http://example.test/terminal")
+    screencast.end_track("terminal")
+
+    assert "corner" not in library_module._SESSION.timeline.tracks[0]
+
+
+def test_reusing_a_track_name_across_two_start_end_cycles_raises(tmp_path):
+    """add_track_clip() rejects a name already recorded on this timeline --
+    see its own docstring for why a second Start Track/End Track cycle
+    reusing a closed track's name must not be allowed to silently merge or
+    shadow the first one at compose time."""
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.start_track("terminal", "http://example.test/terminal")
+    screencast.end_track("terminal")
+    # Refused at Start Track, before a whole second track is recorded only
+    # for End Track to reject it.
+    with pytest.raises(FatalError, match="already recorded"):
+        screencast.start_track("terminal", "http://example.test/terminal-2")
+    assert "terminal" not in library_module._SESSION.tracks
+
+
+def test_track_style_arguments_given_as_strings_are_stored_as_numbers(tmp_path):
+    """(regression) Robot Framework passes `scale=0.3 margin=16 border=2` as
+    strings (their default is None, so it has no type to convert to). They
+    used to be written into timeline.json as strings, failing the schema
+    only later, at compose/verify time."""
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.start_track(
+        "terminal",
+        "http://example.test/terminal",
+        focusable="False",
+        fade="True",
+        scale="0.3",
+        margin="16",
+        border="2",
+    )
+    screencast.end_track("terminal")
+
+    clip = library_module._SESSION.timeline.tracks[0]
+    assert clip["scale"] == 0.3 and isinstance(clip["scale"], float)
+    assert clip["margin"] == 16 and isinstance(clip["margin"], int)
+    assert clip["border"] == 2 and isinstance(clip["border"], int)
+    assert clip["focusable"] is False
+    assert clip["fade"] is True
+    library_module._SESSION.timeline.copy()  # re-validates against the schema
+
+
+def test_start_track_rejects_an_unknown_corner(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    with pytest.raises(FatalError, match="Unknown corner"):
+        screencast.start_track(
+            "terminal", "http://example.test/terminal", corner="middle"
+        )
+
+
+def test_end_observer_closes_and_records_a_track_left_open(tmp_path):
+    """(regression) A story that forgets End Track used to lose the track:
+    its video was never flushed nor added to the timeline."""
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.start_track("terminal", "http://example.test/terminal")
+    track_context = library_module._SESSION.tracks["terminal"]["context"]
+    screencast.end_observer()
+
+    assert track_context.closed
+    assert library_module._SESSION.tracks == {}
+    assert [t["name"] for t in library_module._SESSION.timeline.tracks] == ["terminal"]
+
+
+def test_start_track_sets_current_page_and_end_track_restores_the_observer(
+    tmp_path,
+):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    observer_page = library_module._SESSION.current_page
+    screencast.start_track("terminal", "http://example.test/terminal")
+    assert library_module._SESSION.current_page is not observer_page
+    screencast.end_track("terminal")
+    assert library_module._SESSION.current_page is observer_page
+
+
+def test_starting_the_same_track_twice_raises(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.start_track("terminal", "http://example.test/terminal")
+    with pytest.raises(FatalError):
+        screencast.start_track("terminal", "http://example.test/terminal")
+
+
+def test_end_track_without_start_raises(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    with pytest.raises(FatalError):
+        screencast.end_track("terminal")
 
 
 def test_timeline_written_to_disk_by_the_listener_on_close(tmp_path):

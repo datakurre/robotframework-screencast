@@ -98,6 +98,7 @@ class Timeline:
                 "version": VERSION,
                 "observer": {"name": observer_name, "video": str(observer_video)},
                 "actors": [],
+                "tracks": [],
                 "events": [],
             }
         )
@@ -124,6 +125,13 @@ class Timeline:
         return self.data["actors"]
 
     @property
+    def tracks(self):
+        # Optional in the schema (absent on a timeline written before this
+        # field existed) -- a plain list access would KeyError on one of
+        # those instead of just reporting no tracks.
+        return self.data.get("tracks", [])
+
+    @property
     def events(self):
         return self.data["events"]
 
@@ -143,6 +151,62 @@ class Timeline:
         if duration is not None:
             clip["duration"] = duration
         self.data["actors"].append(clip)
+        return clip
+
+    def add_track_clip(
+        self,
+        name,
+        video,
+        offset,
+        focusable=True,
+        fade=False,
+        scale=None,
+        margin=None,
+        border=None,
+        corner=None,
+    ):
+        """Record a track opened with `Screencast.start_track()` -- a second
+        (third, ...) context recorded for the whole take alongside the
+        observer, that `Focus(view=name)` can later make the composer's
+        main view (see `compose._view_at`), not just an always-present
+        corner inset the way `compose()`'s external `tracks=` is -- unless
+        `focusable` is False, a structural guarantee it never is. `fade`
+        makes its own inset rendering fade out past its left third (see
+        `compose.pad_inset_faded`). `scale`/`margin`/`border`/`corner`
+        override its own inset's size/spacing/corner (schema defaults
+        0.4/24/3/bottom-left, the same as a focus event's own inset -- see
+        compose.DEFAULT_SCALE/MARGIN/BORDER) -- `None` (the default for
+        each) leaves it unset so the schema default applies, same as any of
+        them being left out of a hand-edited timeline.json entirely. All
+        six omitted when at their default, the same convention
+        `add_actor_clip`'s `duration` already follows, so a timeline that
+        never asked for any of them reads exactly as before they existed.
+
+        Raises `TimelineError` if `name` was already used for an earlier
+        track on this same timeline -- `Focus(view=name)` and `compose()`'s
+        own `track_defs_by_name` both resolve a track by name alone, so two
+        clips sharing one would make either unreachable or silently merge,
+        the one thing this is here to rule out."""
+        if any(t["name"] == name for t in self.data.get("tracks", [])):
+            raise TimelineError(
+                f"Track name {name!r} was already recorded on this timeline "
+                "-- track names must be unique for Focus(view=name) and "
+                "compose() to resolve them unambiguously"
+            )
+        clip = {"name": name, "video": str(video), "offset": offset}
+        if not focusable:
+            clip["focusable"] = False
+        if fade:
+            clip["fade"] = True
+        if scale is not None:
+            clip["scale"] = scale
+        if margin is not None:
+            clip["margin"] = margin
+        if border is not None:
+            clip["border"] = border
+        if corner is not None:
+            clip["corner"] = corner
+        self.data.setdefault("tracks", []).append(clip)
         return clip
 
     def add_event(self, event):

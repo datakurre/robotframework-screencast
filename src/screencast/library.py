@@ -38,6 +38,7 @@ DEFAULT_VIEWPORT = {"width": 1920, "height": 1080}
 DEFAULT_OBSERVE_WAIT = 1.5
 DEFAULT_RETURN_TO_OBSERVER_WAIT = 6.0
 DEFAULT_CAPTION_DURATION = 4.0
+TRACK_CORNERS = ("bottom-left", "bottom-right", "top-left", "top-right")
 HOLD_VIEWS = ("observer", "actor")
 # Injected as an init script by Hide Cursor, so the cursor stays hidden on
 # every later document in the context, not just the current one (the cursor
@@ -126,6 +127,7 @@ class _Session:
         self.observer_name = None
         self.observer_context = None
         self.observer_page = None
+        self.tracks = {}
         self.current_page = None
         self.current_actor = None
         self._turn_context = None
@@ -471,14 +473,174 @@ class Screencast:
         very last keyword. Without it the observer's .webm never finishes
         writing and ffprobe sees a near-empty file, since Playwright only
         flushes a context's video on `close()`. Does not stop the browser
-        itself -- that stays alive for a following `probe` call."""
+        itself -- that stays alive for a following `probe` call.
+
+        A track still open (no `End Track`) is closed and recorded first,
+        with a warning -- otherwise its video would never be flushed and it
+        would silently be missing from the composed output."""
         context = _SESSION.observer_context
         if context is None:
             raise FatalError("No observer -- call Start Observer first")
+        for name in list(_SESSION.tracks):
+            logger.warn(f"Track {name!r} was still open at End Observer; closing it")
+            self.end_track(name)
         context.close()
         _SESSION.observer_context = None
         _SESSION.observer_page = None
         _SESSION.current_page = None
+
+    # -- extra tracks -----------------------------------------------------
+    #
+    # A *track* is a second (third, ...) context recorded for the whole
+    # take alongside the observer -- e.g. an ambient terminal -- that a
+    # story can later `Focus` onto as the main view, not just composite as
+    # an always-present corner inset the way `compose()`'s external
+    # `tracks=`/`--track` does for a recording the engine itself never
+    # drove (see that function's own docstring). A track recorded this way
+    # is written into `timeline.json` itself (`Timeline.add_track_clip`),
+    # with its `offset` measured against the same clock the observer and
+    # every actor turn already share -- `compose()` picks it up
+    # automatically, no `--track`/manual offset guessing needed.
+    #
+    # Two screens (just the observer, pointed at a terminal -- see the
+    # skill reference's "Using a ttyd terminal as the observer") don't need
+    # this; reach for it only once a take wants a *third* (or more)
+    # continuously-recorded, independently focusable screen.
+
+    def start_track(
+        self,
+        name,
+        url,
+        storage_state=None,
+        focusable=True,
+        fade=False,
+        scale=None,
+        margin=None,
+        border=None,
+        corner=None,
+    ):
+        """Open an extra continuously-recorded context/page, from now until
+        `End Track`, alongside the observer. Requires `Start Observer` to
+        already be running (a track's `offset` is measured on its clock).
+        Sets `current_page` to the new track's page, same convenience
+        `Start Observer` itself provides, so a same-page setup call (e.g.
+        `Hide Cursor`, for a terminal track) can follow immediately without
+        a separate keyword to target it -- see `library.py`'s `_page()` for
+        why this is safe here (no actor turn can be open yet when a story
+        still mid-`Start Observing` calls this).
+
+        `focusable=False` is a structural guarantee that `Focus(view=name)`
+        can never make this track the main view -- for a track meant to
+        always stay a corner inset (e.g. a shell that should never take
+        over the full frame), this is safer than simply never writing such
+        a `Focus` call, which a later story edit could still do by mistake.
+        `fade=True` makes that corner inset itself fade out past its left
+        third (see `compose.pad_inset_faded`) -- most useful together with
+        `focusable=False`, so the one thing always on screen in that corner
+        gradually gives way to the main view, but independent of it: a
+        focusable track can fade too, it only ever affects its own inset
+        rendering, never a segment where it is main. `scale`/`margin`/
+        `border`/`corner` override this track's own inset size/spacing/
+        corner (schema defaults 0.4/24/3/bottom-left) -- `None` (the
+        default for each) leaves it unset so the schema default applies;
+        only ever affects its inset rendering too, same as `fade`. Set
+        `corner` when a take has more than one always-present inset at
+        once (another track, or a focus-demoted actor/observer) that would
+        otherwise collide in the same corner -- e.g. a second track at
+        `corner=top-left` alongside a first left at the `bottom-left`
+        default.
+
+        A track name must be unique across the whole take -- this raises
+        if the name was already recorded earlier (even if its
+        earlier `Start Track`/`End Track` pair already closed), since
+        `Focus(view=name)` and `compose()` both resolve a track by name
+        alone and could not tell two same-named clips apart."""
+        if _SESSION.started is None:
+            raise FatalError("No observer -- call Start Observer first")
+        if name in _SESSION.tracks:
+            raise FatalError(f"Start Track was already called for {name!r}")
+        if _SESSION.timeline is not None and any(
+            t["name"] == name for t in _SESSION.timeline.tracks
+        ):
+            # Checked here, not only by add_track_clip() at End Track, so a
+            # reused name fails before the whole track is recorded for nothing.
+            raise FatalError(
+                f"Track {name!r} was already recorded earlier in this take -- "
+                "track names must be unique"
+            )
+        # Robot Framework passes these as strings (their default is None, so
+        # it has no type to convert to); timeline.json needs numbers.
+        scale = None if scale is None else float(scale)
+        margin = None if margin is None else int(margin)
+        border = None if border is None else int(border)
+        if corner is not None and corner not in TRACK_CORNERS:
+            raise FatalError(
+                f"Unknown corner {corner!r} -- expected one of "
+                f"{', '.join(TRACK_CORNERS)}"
+            )
+        context_kwargs = {"viewport": _SESSION.viewport}
+        if _SESSION.record:
+            context_kwargs["record_video_dir"] = str(_SESSION.take_dir)
+            context_kwargs["record_video_size"] = _SESSION.viewport
+        if storage_state:
+            context_kwargs["storage_state"] = storage_state
+        try:
+            context = _SESSION.browser.new_context(**context_kwargs)
+            context.add_init_script(CURSOR_SCRIPT)
+            page = context.new_page()
+            # Same reasoning as start_observer(): capture the offset at
+            # page creation, before goto(), so it is not inflated by
+            # however long the first navigation took.
+            offset = _SESSION.elapsed()
+            _track_console(page)
+            _SESSION.open_pages.append(page)
+            page.goto(url, wait_until="load")
+        except Exception as error:
+            raise FatalError(
+                f"Could not start track {name!r} at {url}: {error}"
+            ) from error
+        _SESSION.tracks[name] = {
+            "context": context,
+            "page": page,
+            "offset": offset,
+            "focusable": _as_bool(focusable),
+            "fade": _as_bool(fade),
+            "scale": scale,
+            "margin": margin,
+            "border": border,
+            "corner": corner,
+        }
+        _SESSION.current_page = page
+
+    def end_track(self, name):
+        """Close a track opened with `Start Track`, flushing its video and
+        recording it on the timeline. Call before `End Observer` (the
+        observer "closes last" -- see its own docstring)."""
+        track = _SESSION.tracks.get(name)
+        if track is None:
+            raise FatalError(f"No track named {name!r} -- call Start Track first")
+        video_path = (
+            track["page"].video.path()
+            if _SESSION.record and track["page"].video
+            else None
+        )
+        track["context"].close()
+        del _SESSION.tracks[name]
+        if _SESSION.current_page is track["page"]:
+            _SESSION.current_page = _SESSION.observer_page
+        if _SESSION.timeline is not None and video_path:
+            _SESSION.timeline.add_track_clip(
+                name,
+                Path(video_path).name,
+                offset=track["offset"],
+                focusable=track["focusable"],
+                fade=track["fade"],
+                scale=track["scale"],
+                margin=track["margin"],
+                border=track["border"],
+                corner=track["corner"],
+            )
+            _save_timeline()
 
     def observe(self, url=None, wait=DEFAULT_OBSERVE_WAIT, reload=False):
         """Bring the observer to the front, and refresh it. With `url`, this
@@ -751,11 +913,26 @@ class Screencast:
         )
         _save_timeline()
 
-    def focus(self, view, scale=0.4, margin=24, border=3):
-        """Record which recording ('actor' or 'observer') is the composer's
-        main view from this point on; the other becomes the inset."""
-        if view not in ("actor", "observer"):
-            raise FatalError(f"Focus view must be 'actor' or 'observer', got {view!r}")
+    def focus(self, view, scale=0.4, margin=24, border=3, solo=False):
+        """Record which recording is the composer's main view from this
+        point on; the others become insets. `view` is `'actor'`,
+        `'observer'`, or the `name` of a track opened with `Start Track` --
+        the composer resolves a track name against the take's own recorded
+        tracks at compose time (see `compose._view_at`), so this does not
+        validate it against `_SESSION.tracks` here: a track closed with
+        `End Track` earlier in the same turn, or not opened until later in
+        the take, is still a legitimate name to focus temporarily away from
+        and back to.
+
+        `solo=True` turns every inset off from this point on -- not just
+        the usual actor/observer cross-inset, but every track's own
+        always-present corner inset too -- until the next `Focus` call
+        says otherwise. Use it to end a take on the main view alone (e.g.
+        matching a trailing `Hold`, which already never renders an inset):
+        nothing else can turn an inset back off once a turn or a track has
+        made one available."""
+        if not view:
+            raise FatalError(f"Focus view must be a non-empty name, got {view!r}")
         if _SESSION.timeline is None:
             raise FatalError("No timeline -- call Start Observer first")
         _SESSION.timeline.add_event(
@@ -766,6 +943,7 @@ class Screencast:
                 "scale": float(scale),
                 "margin": int(margin),
                 "border": int(border),
+                "solo": bool(solo),
             }
         )
         _save_timeline()
