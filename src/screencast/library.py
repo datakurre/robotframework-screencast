@@ -38,6 +38,7 @@ DEFAULT_VIEWPORT = {"width": 1920, "height": 1080}
 DEFAULT_OBSERVE_WAIT = 1.5
 DEFAULT_RETURN_TO_OBSERVER_WAIT = 6.0
 DEFAULT_CAPTION_DURATION = 4.0
+HOLD_VIEWS = ("observer", "actor")
 # Injected as an init script by Hide Cursor, so the cursor stays hidden on
 # every later document in the context, not just the current one (the cursor
 # itself is an init script too, and comes back on every navigation).
@@ -774,6 +775,12 @@ class Screencast:
         moment, e.g. after a submit, or over the final History view."""
         if _SESSION.timeline is None:
             raise FatalError("No timeline -- call Start Observer first")
+        if view not in HOLD_VIEWS:
+            # The schema only allows these two; anything else would make
+            # the whole timeline.json fail to load at compose time.
+            raise FatalError(
+                f"Hold view must be one of {', '.join(HOLD_VIEWS)}, got {view!r}"
+            )
         _SESSION.timeline.add_event(
             {
                 "type": "hold",

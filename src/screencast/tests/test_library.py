@@ -235,6 +235,13 @@ def test_hide_cursor_survives_navigation(tmp_path):
     assert "#screencast-recording-cursor" in library_module.HIDE_CURSOR_SCRIPT
 
 
+def test_hold_rejects_a_view_the_timeline_schema_does_not_allow(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    with pytest.raises(FatalError, match="Hold view"):
+        screencast.hold(2, view="terminal")
+
+
 def test_actor_turn_starts_with_the_cursor_centered(tmp_path):
     """(regression, #17) The injected cursor's CSS centers it by default,
     but an incidental early mousemove (e.g. from Playwright's own
