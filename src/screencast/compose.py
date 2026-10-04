@@ -16,7 +16,12 @@ turn_start/turn_end/focus/chapter/hold event boundary:
   (default: observer), with the most recently active actor's clip as the
   inset -- live footage if their turn is still technically open (main
   flipped to observer by a `focus` event without a matching turn_end yet),
-  otherwise their clip's last frame, frozen.
+  otherwise their clip's last frame, frozen. A gap `focus` event can also
+  bring that actor back as the *main* view instead (e.g. a story
+  deliberately ending on their last frame, via `Focus actor` left in
+  effect through `End Actor Turn`) -- past `turn_end` there is no more
+  live footage for them either way, so this is their last frame, frozen,
+  same as the inset case just describes.
 - A `chapter` event inserts an independent title-card segment (rendered
   once, cached) ahead of the live segment starting at the same instant.
   Title cards add output time; they do not consume any recorded footage,
@@ -487,7 +492,21 @@ def compose(take_dir, output=None):
         label = next_label("seg")
         if view == "actor":
             main_label = next_label("main")
-            turn_slice(main_label, inset_turn_id, start, end)
+            _turn_start, turn_end = turns_by_id[inset_turn_id]
+            if end <= turn_end + 1e-6:
+                # The turn is still open for this whole segment: live footage.
+                turn_slice(main_label, inset_turn_id, start, end)
+            else:
+                # Focus was flipped to "actor" and never flipped back before
+                # the turn closed (e.g. a story deliberately ending on the
+                # actor's last frame) -- the turn has no more live footage
+                # past its own turn_end, so this segment would otherwise ask
+                # turn_slice() to trim a range starting at or beyond the
+                # clip's own recorded length (rel_start >= rel_end), handing
+                # ffmpeg a backwards/empty trim and silently producing a
+                # near-zero-length segment -- exactly the inset branch below
+                # already guards against with this same turn_end clamp.
+                frozen_turn_slice(main_label, inset_turn_id, turn_end, end - start)
             inset_label = next_label("inset")
             observer_slice(f"{inset_label}raw", start, end)
             pad_inset(f"{inset_label}raw", inset_label, scale, border)

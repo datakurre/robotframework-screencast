@@ -102,6 +102,61 @@ def make_clip(path, duration, color="blue"):
     )
 
 
+# Named ffmpeg colors, as 8-bit RGB -- used to check a sampled corner pixel
+# against the clip color that should (or should not) be composited there.
+_NAMED_COLOR_RGB = {
+    "blue": (0, 0, 255),
+    "red": (255, 0, 0),
+    "yellow": (255, 255, 0),
+    "magenta": (255, 0, 255),
+}
+
+
+def corner_pixel(video, at, corner, offset=100, size=40):
+    """Average RGB of a small sample square inward from the given corner at
+    `at` seconds -- used to check whether (and which) PiP inset is visible
+    there. Sampled `offset` px in from both near edges (not at the literal
+    0/0 corner), since an inset's own box starts `margin` px in from the
+    frame edge -- a sample at the exact pixel corner would land partly on
+    background instead of inside the inset."""
+    crop = {
+        "bottom-left": f"{size}:{size}:{offset}:ih-{offset + size}",
+        "bottom-right": f"{size}:{size}:iw-{offset + size}:ih-{offset + size}",
+        "top-left": f"{size}:{size}:{offset}:{offset}",
+        "top-right": f"{size}:{size}:iw-{offset + size}:{offset}",
+    }[corner]
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-ss",
+            f"{max(0.0, at):.3f}",
+            "-i",
+            str(video),
+            "-frames:v",
+            "1",
+            "-vf",
+            f"crop={crop},scale=1:1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    data = result.stdout
+    assert len(data) >= 3, f"Could not sample a frame at {at:.2f}s from {video}"
+    return tuple(data[:3])
+
+
+def is_color(pixel, name, tol=60):
+    target = _NAMED_COLOR_RGB[name]
+    return all(abs(p - t) <= tol for p, t in zip(pixel, target, strict=True))
+
+
 @requires_ffmpeg
 def test_compose_a_simple_take_produces_a_valid_output(tmp_path):
     take_dir = tmp_path / "take"
@@ -263,6 +318,58 @@ def test_compose_uses_a_focus_events_own_border_not_the_default(tmp_path, monkey
     filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
     assert "pad=iw+18:ih+18:9:9:" in filter_complex
     assert f"pad=iw+{2 * compose_module.DEFAULT_BORDER}:" not in filter_complex
+
+
+@requires_ffmpeg
+def test_compose_with_actor_focus_lingering_past_turn_end_freezes_instead_of_breaking(
+    tmp_path,
+):
+    """(regression) A story that sets `Focus actor` and never flips it back
+    before the turn's own `[Teardown] End Actor Turn` -- e.g. deliberately
+    ending a take on the actor's own last frame -- leaves the gap after
+    `turn_end` still resolving to "actor" (see
+    test_gap_focus_event_can_bring_back_the_actor, a pure-_view_at test
+    covering exactly this). But the main per-boundary loop's
+    `if view == "actor":` branch called turn_slice() unconditionally, with
+    no `turn_end` clamp -- unlike the observer-main/actor-inset branch just
+    below it, which already guards this exact case (`if end <= turn_end:
+    turn_slice() else: frozen_turn_slice()`). Past `turn_end`,
+    turn_slice()'s own `rel_start` (clamped to `clip["duration"]`) can land
+    at or past `rel_end`, handing ffmpeg's trim filter a backwards/empty
+    range -- which silently produced a near-zero-length segment, chopping
+    real seconds off the composed output instead of showing a frozen frame
+    the way the inset branch already does."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 6.0, color="blue")
+    make_clip(take_dir / "author.webm", 2.0, color="red")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_actor_clip("author", "author.webm", offset=1.0, duration=2.0)
+    timeline.add_event({"type": "turn_start", "time": 1.0, "actor": "author"})
+    timeline.add_event(
+        {
+            "type": "focus",
+            "time": 3.0,
+            "view": "actor",
+            "scale": 0.4,
+            "margin": 24,
+            "border": 3,
+        }
+    )
+    timeline.add_event({"type": "turn_end", "time": 3.0, "actor": "author"})
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(take_dir)
+    # No chapters/non-recorded holds in this timeline: the composed
+    # output's duration must equal the observer's own -- a broken trim on
+    # the [3.0, 6.0) gap segment would have come up short instead.
+    assert ffprobe_duration(output) == pytest.approx(6.0, abs=0.5)
+    # Well past the turn (and the actor clip's own 2.0s of real footage):
+    # still showing the actor, frozen on its last frame, as the main view
+    # (top-left is free of any inset in this minimal setup -- the engine's
+    # own observer-as-inset default sits bottom-right).
+    assert is_color(corner_pixel(output, 5.0, "top-left"), "red")
 
 
 @requires_ffmpeg
