@@ -38,6 +38,26 @@ DEFAULT_VIEWPORT = {"width": 1920, "height": 1080}
 DEFAULT_OBSERVE_WAIT = 1.5
 DEFAULT_RETURN_TO_OBSERVER_WAIT = 6.0
 DEFAULT_CAPTION_DURATION = 4.0
+# Injected as an init script by Hide Cursor, so the cursor stays hidden on
+# every later document in the context, not just the current one (the cursor
+# itself is an init script too, and comes back on every navigation).
+HIDE_CURSOR_CSS = (
+    "#screencast-recording-cursor,.screencast-recording-click{display:none !important}"
+)
+HIDE_CURSOR_SCRIPT = """
+(() => {
+  const install = () => {
+    const style = document.createElement('style');
+    style.textContent = __CSS__;
+    document.documentElement.appendChild(style);
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', install, {once: true});
+  } else {
+    install();
+  }
+})();
+""".replace("__CSS__", json.dumps(HIDE_CURSOR_CSS))
 
 # RF BuiltIn keywords whose own outcome means a failure nested inside them
 # was expected/recovered, not real -- see _Listener._pop_recovery_boundary.
@@ -782,6 +802,25 @@ class Screencast:
             }
         )
         _save_timeline()
+
+    def hide_cursor(self):
+        """Hide the injected human-paced cursor
+        (`#screencast-recording-cursor`) on the current page outright,
+        instead of relying on its ~3s idle fade (see `screencast/cursor.py`)
+        -- for a turn with no mouse interaction at all (a terminal, say:
+        see "Using a ttyd terminal as the observer" in reference.md), where
+        the cursor looks out of place even appearing once. The click-ripple
+        (`.screencast-recording-click`) is a separate, classless element the
+        click handler creates fresh each time; hidden here too, since a
+        turn that calls this has usually already done its one deliberate
+        click (e.g. to focus a terminal) before going keyboard-only.
+
+        Stays in effect for the rest of the page's context (the turn, the
+        track, or the observer), across navigations too: the cursor is
+        re-injected on every new document, so this is as well."""
+        page = self._page()
+        page.context.add_init_script(HIDE_CURSOR_SCRIPT)
+        page.add_style_tag(content=HIDE_CURSOR_CSS)
 
     # -- human-paced input, against the current page -----------------------
 

@@ -205,6 +205,36 @@ def test_turn_start_falls_back_to_context_creation_if_never_navigated(tmp_path):
     assert [event["actor"] for event in starts] == ["author"]
 
 
+def test_hide_cursor_adds_a_style_tag_hiding_cursor_and_click_ripple(tmp_path):
+    """`Hide Cursor` is the outright alternative to the injected cursor's
+    ~3s idle fade, for a turn with no mouse interaction at all (e.g. a
+    ttyd terminal observer) where the cursor looks out of place even
+    appearing once."""
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("terminal", "http://example.test/terminal")
+    screencast.hide_cursor()
+
+    page = library_module._SESSION.current_page
+    assert len(page.style_tags) == 1
+    assert "#screencast-recording-cursor" in page.style_tags[0]
+    assert ".screencast-recording-click" in page.style_tags[0]
+    assert "display:none" in page.style_tags[0]
+
+
+def test_hide_cursor_survives_navigation(tmp_path):
+    """(regression) The cursor is an init script, re-injected on every new
+    document; a style tag alone only hid it until the next navigation (e.g.
+    a turn's own first Go To). Hide Cursor now adds an init script too."""
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.start_actor_turn("author")
+    screencast.hide_cursor()
+
+    context = library_module._SESSION._turn_page.context
+    assert context.init_scripts[-1] == library_module.HIDE_CURSOR_SCRIPT
+    assert "#screencast-recording-cursor" in library_module.HIDE_CURSOR_SCRIPT
+
+
 def test_actor_turn_starts_with_the_cursor_centered(tmp_path):
     """(regression, #17) The injected cursor's CSS centers it by default,
     but an incidental early mousemove (e.g. from Playwright's own

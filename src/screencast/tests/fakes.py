@@ -112,6 +112,7 @@ class FakePage:
             FakeVideo(f"/tmp/fake-{FakePage._counter}.webm") if record else None
         )
         self._handlers = {}
+        self.style_tags = []
 
     def goto(self, url, wait_until="load"):
         self.url = url
@@ -139,6 +140,9 @@ class FakePage:
 
     def screenshot(self, path, full_page=True):
         pass
+
+    def add_style_tag(self, content=None, path=None):
+        self.style_tags.append(content)
 
     def is_closed(self):
         return self.closed

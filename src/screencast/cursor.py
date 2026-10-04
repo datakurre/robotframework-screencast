@@ -22,6 +22,7 @@ CURSOR_SCRIPT = """
         width: 24px; height: 24px;
         border: 2px solid #ff3b30; border-radius: 50%; pointer-events: none;
         transform: translate(-50%, -50%); box-shadow: 0 0 0 2px white;
+        opacity: 1; transition: opacity 0.4s ease;
       }
       .screencast-recording-click {
         position: fixed; z-index: 2147483646; width: 56px; height: 56px;
@@ -37,10 +38,25 @@ CURSOR_SCRIPT = """
     const cursor = document.createElement('div');
     cursor.id = 'screencast-recording-cursor';
     document.documentElement.appendChild(cursor);
+    let idleTimer = null;
+    const scheduleIdleFade = () => {
+      if (idleTimer !== null) {
+        clearTimeout(idleTimer);
+      }
+      idleTimer = setTimeout(() => {
+        cursor.style.opacity = '0';
+      }, 3000);
+    };
     document.addEventListener('mousemove', event => {
       cursor.style.left = `${event.clientX}px`;
       cursor.style.top = `${event.clientY}px`;
+      cursor.style.opacity = '1';
+      scheduleIdleFade();
     }, true);
+    // Schedule once at install time too, so a cursor that never moves at
+    // all (e.g. a turn that only types or clicks without ever moving) still
+    // fades out after the idle timeout instead of staying visible forever.
+    scheduleIdleFade();
     document.addEventListener('click', event => {
       const click = document.createElement('div');
       click.className = 'screencast-recording-click';
