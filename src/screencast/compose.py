@@ -110,7 +110,24 @@ def make_title_card(path, eyebrow, title, subtitle, duration):
         "drawtext=font='DejaVu Sans':"
         f"text='{_escape_drawtext(title)}':fontcolor=white:fontsize=76:x=160:y=420,"
         "drawtext=font='DejaVu Sans':"
-        f"text='{_escape_drawtext(subtitle)}':fontcolor=#cbd5e1:fontsize=40:x=160:y=560"
+        f"text='{_escape_drawtext(subtitle)}':fontcolor=#cbd5e1:fontsize=40:x=160:y=560,"
+        # Countdown bar: full-width at t=0, shrinking to zero width by
+        # t=duration, so the card visibly counts down its own on-screen
+        # time. drawbox's x/y/w/h expressions are only ever evaluated once,
+        # at filter init -- unlike drawtext, it has no `eval=frame` option
+        # to force per-frame re-evaluation (confirmed against this ffmpeg
+        # build: passing `eval=frame` to drawbox is a hard "Option not
+        # found" error, and leaving it off renders a bar frozen at its t=0
+        # width for the whole clip). geq, by contrast, evaluates its pixel
+        # expressions per frame by design (its whole purpose), so it is
+        # used here instead for the same visual effect: every pixel in the
+        # bottom 8px strip is recolored sky-blue only while its X coordinate
+        # is left of the shrinking threshold `W*(1-T/duration)`, and left
+        # untouched (passed through via r(X,Y)/g(X,Y)/b(X,Y)) elsewhere.
+        "geq="
+        f"r='if(gte(Y,H-8)*lt(X,(W)*(1-T/{float(duration):.3f})),125,r(X,Y))':"
+        f"g='if(gte(Y,H-8)*lt(X,(W)*(1-T/{float(duration):.3f})),211,g(X,Y))':"
+        f"b='if(gte(Y,H-8)*lt(X,(W)*(1-T/{float(duration):.3f})),252,b(X,Y))'"
     )
     ffmpeg(
         "-y",
