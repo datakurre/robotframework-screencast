@@ -370,17 +370,26 @@ def verify(take_dir, output_video=None, contact_sheet=None, rows=6, cols=5):
                 }
             )
 
-    for start_event in timeline.events_of("turn_start"):
+    # Pair each turn_start with the turn_end that follows it, not with the
+    # first turn_end of the same actor: an actor with several turns would
+    # otherwise have every later turn paired with their first turn's end,
+    # sampling a midpoint before the turn even started.
+    remaining_ends = sorted(timeline.events_of("turn_end"), key=lambda e: e["time"])
+    for start_event in sorted(
+        timeline.events_of("turn_start"), key=lambda e: e["time"]
+    ):
         end_event = next(
             (
                 e
-                for e in timeline.events_of("turn_end")
+                for e in remaining_ends
                 if e["actor"] == start_event["actor"]
+                and e["time"] >= start_event["time"]
             ),
             None,
         )
         if end_event is None:
             continue
+        remaining_ends.remove(end_event)
         midpoint = min(
             (start_event["time"] + end_event["time"]) / 2, observer_duration - 0.05
         )

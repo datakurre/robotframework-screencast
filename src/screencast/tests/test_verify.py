@@ -259,6 +259,43 @@ def test_verify_warns_when_waiting_adds_up_though_no_wait_is_long(tmp_path):
 
 
 @requires_ffmpeg
+def test_verify_samples_each_turn_of_a_repeated_actor_at_its_own_midpoint(
+    tmp_path, monkeypatch
+):
+    """(regression) The empty-inset check paired every turn_start with the
+    *first* turn_end of the same actor, so a second turn's midpoint fell
+    between its own start and its first turn's end -- before it started."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_animated_clip(take_dir / "observer.webm", 8.0)
+    make_animated_clip(take_dir / "reception-1.webm", 2.0)
+    make_animated_clip(take_dir / "reception-2.webm", 2.0)
+    timeline = Timeline.new("observer.webm")
+    timeline.add_actor_clip("reception", "reception-1.webm", offset=1.0)
+    timeline.add_event({"type": "turn_start", "time": 1.0, "actor": "reception"})
+    timeline.add_event({"type": "turn_end", "time": 3.0, "actor": "reception"})
+    timeline.add_actor_clip("reception", "reception-2.webm", offset=5.0)
+    timeline.add_event({"type": "turn_start", "time": 5.0, "actor": "reception"})
+    timeline.add_event({"type": "turn_end", "time": 7.0, "actor": "reception"})
+    timeline.save(take_dir / "timeline.json")
+    compose(take_dir)
+
+    import screencast.verify as verify_module
+
+    real_frame_luma_range = verify_module.frame_luma_range
+    observer_samples = []
+
+    def spy(video, at, *args, **kwargs):
+        if video.name == "observer.webm":
+            observer_samples.append(at)
+        return real_frame_luma_range(video, at, *args, **kwargs)
+
+    monkeypatch.setattr(verify_module, "frame_luma_range", spy)
+    verify(take_dir)
+    assert observer_samples == [pytest.approx(2.0), pytest.approx(6.0)]
+
+
+@requires_ffmpeg
 def test_verify_passes_a_clean_composed_take(tmp_path):
     take_dir = tmp_path / "take"
     make_take(take_dir)
