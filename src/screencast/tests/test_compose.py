@@ -225,6 +225,84 @@ def test_compose_does_not_extend_output_for_a_recorded_hold(tmp_path):
 
 
 @requires_ffmpeg
+def test_compose_opens_on_the_title_card_when_the_first_chapter_precedes_its_turn(
+    tmp_path,
+):
+    """(regression) A turn's chapter event is timestamped when its first `Go
+    To` finishes loading, not when `Start Actor Turn` opens the context (see
+    library.py's start_actor_turn()/_record_turn_start()), so there is
+    otherwise a stretch of raw observer footage -- Start Observer's own
+    load, the first turn's context creation, its first navigation -- ahead
+    of the very first title card. When that first chapter fires at or
+    before the take's first turn even starts (here: at exactly the same
+    instant), compose() must drop the leading 0.0 boundary so the output
+    opens directly on the title card instead of that raw preamble."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 5.0)
+    make_clip(take_dir / "author.webm", 3.0, color="red")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_actor_clip("author", "author.webm", offset=1.0, duration=3.0)
+    timeline.add_event({"type": "turn_start", "time": 1.0, "actor": "author"})
+    timeline.add_event(
+        {
+            "type": "chapter",
+            "time": 1.0,
+            "eyebrow": "Story",
+            "title": "Author",
+            "subtitle": "Doing a thing",
+            "duration": 2.0,
+        }
+    )
+    timeline.add_event({"type": "turn_end", "time": 4.0, "actor": "author"})
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(take_dir)
+    # Without the fix: 1.0s leading raw segment (observer, [0.0, 1.0)) +
+    # 2.0s title card + 3.0s actor turn + 1.0s trailing observer gap = 7.0s.
+    # With the fix, the leading 1.0s raw segment is dropped: 2.0s title
+    # card + 3.0s actor turn + 1.0s trailing observer gap = 6.0s.
+    assert ffprobe_duration(output) == pytest.approx(6.0, abs=0.5)
+
+
+@requires_ffmpeg
+def test_compose_drops_the_whole_lead_in_even_with_an_event_inside_it(tmp_path):
+    """(regression) A focus event during Start Observing (here at 2.0s)
+    adds a boundary inside the lead-in. Only the 0.0 boundary used to be
+    dropped, so [2.0, 5.0) of raw lead-in still rendered ahead of the card,
+    3s more than verify's predicted_duration() expects."""
+    take_dir = tmp_path / "take"
+    take_dir.mkdir()
+    make_clip(take_dir / "observer.webm", 8.0)
+    make_clip(take_dir / "author.webm", 3.0, color="red")
+
+    timeline = Timeline.new("observer.webm")
+    timeline.add_event({"type": "focus", "time": 2.0, "view": "observer"})
+    timeline.add_actor_clip("author", "author.webm", offset=5.0, duration=2.0)
+    timeline.add_event({"type": "turn_start", "time": 5.0, "actor": "author"})
+    timeline.add_event(
+        {
+            "type": "chapter",
+            "time": 5.0,
+            "eyebrow": "Story",
+            "title": "Author",
+            "subtitle": "Doing a thing",
+            "duration": 2.0,
+        }
+    )
+    timeline.add_event({"type": "turn_end", "time": 7.0, "actor": "author"})
+    timeline.save(take_dir / "timeline.json")
+
+    output = compose(take_dir)
+    # 2.0s title card + [5.0, 8.0) of footage; the [0.0, 5.0) lead-in is gone.
+    assert ffprobe_duration(output) == pytest.approx(5.0, abs=0.5)
+    from screencast.verify import predicted_duration
+
+    assert predicted_duration(timeline, 8.0) == pytest.approx(5.0)
+
+
+@requires_ffmpeg
 def test_compose_is_reproducible_from_the_same_timeline(tmp_path):
     """A human re-cutting a take by editing focus/hold events and
     re-running the composer needs no re-recording -- exercised here by
@@ -434,6 +512,103 @@ def test_output_time_ignores_a_recorded_hold():
     assert _output_time(5.0, [], holds) == pytest.approx(5.0)
 
 
+def test_output_time_subtracts_the_dropped_lead_in():
+    """(regression) compose() drops the lead-in ahead of a leading first
+    chapter (see _leading_shift), so a caption's cue must move back by it
+    too -- it used to play late by exactly that lead-in."""
+    chapters = [{"time": 4.0, "duration": 2.0}]
+    assert _output_time(5.0, chapters, [], shift=4.0) == pytest.approx(3.0)
+
+
+def test_output_time_maps_a_time_inside_the_dropped_lead_in_to_the_start():
+    chapters = [{"time": 4.0, "duration": 2.0}]
+    assert _output_time(1.0, chapters, [], shift=4.0) == pytest.approx(0.0)
+
+
+def test_output_time_ignores_a_hold_inside_the_dropped_lead_in():
+    """compose() drops a hold's boundary with the rest of the lead-in, so
+    it never inserts that hold's freeze."""
+    chapters = [{"time": 4.0, "duration": 2.0}]
+    holds = [{"time": 1.0, "duration": 3.0}]
+    assert _output_time(5.0, chapters, holds, shift=4.0) == pytest.approx(3.0)
+
+
+def test_chapter_windows_accounts_for_a_hold_inserted_before_a_card():
+    """(regression) A non-recorded hold ahead of a chapter adds output time
+    before that card, the same as an earlier card does."""
+    timeline = Timeline.new("observer.webm")
+    timeline.add_event({"type": "turn_start", "time": 0.0, "actor": "author"})
+    timeline.add_event({"type": "hold", "time": 3.0, "duration": 1.5})
+    timeline.add_event(
+        {
+            "type": "chapter",
+            "time": 5.0,
+            "eyebrow": "",
+            "title": "Later",
+            "subtitle": "",
+            "duration": 2.0,
+        }
+    )
+    assert compose_module.chapter_windows(timeline) == [(6.5, 8.5)]
+
+
+def test_chapter_windows_with_no_chapters_is_empty():
+    timeline = Timeline.new("observer.webm")
+    assert compose_module.chapter_windows(timeline) == []
+
+
+def test_chapter_windows_shifts_a_leading_first_chapter_to_zero():
+    """Mirrors test_compose_opens_on_the_title_card_when_the_first_chapter_
+    precedes_its_turn, but as a pure-function check with no ffmpeg
+    involved: the first chapter's own window must start at 0.0, same as
+    the lead-in compose() itself drops."""
+    timeline = Timeline.new("observer.webm")
+    timeline.add_actor_clip("author", "author.webm", offset=1.0, duration=3.0)
+    timeline.add_event({"type": "turn_start", "time": 1.0, "actor": "author"})
+    timeline.add_event(
+        {
+            "type": "chapter",
+            "time": 1.0,
+            "eyebrow": "Story",
+            "title": "Author",
+            "subtitle": "Doing a thing",
+            "duration": 2.0,
+        }
+    )
+    timeline.add_event({"type": "turn_end", "time": 4.0, "actor": "author"})
+    assert compose_module.chapter_windows(timeline) == [(0.0, 2.0)]
+
+
+def test_chapter_windows_accounts_for_every_earlier_cards_duration():
+    """Two chapters, each 2.0s, with the first starting after its own
+    turn (so no lead-in shift applies): the second's window must start
+    only once the first's card has finished playing in the output, not
+    at its own raw (observer-clock) time."""
+    timeline = Timeline.new("observer.webm")
+    timeline.add_event({"type": "turn_start", "time": 0.0, "actor": "author"})
+    timeline.add_event(
+        {
+            "type": "chapter",
+            "time": 0.0,
+            "eyebrow": "",
+            "title": "First",
+            "subtitle": "",
+            "duration": 2.0,
+        }
+    )
+    timeline.add_event(
+        {
+            "type": "chapter",
+            "time": 10.0,
+            "eyebrow": "",
+            "title": "Second",
+            "subtitle": "",
+            "duration": 2.0,
+        }
+    )
+    assert compose_module.chapter_windows(timeline) == [(0.0, 2.0), (12.0, 14.0)]
+
+
 def test_write_captions_vtt_orders_cues_by_time_regardless_of_input_order(tmp_path):
     captions = [
         {"time": 5.0, "text": "second", "duration": 2.0},
@@ -486,10 +661,16 @@ def test_compose_with_captions_writes_a_vtt_sidecar_accounting_for_the_title_car
 
     cues = parse_vtt_cue_times(vtt_path)
     assert len(cues) == 2
-    # "Before" (raw 0.0s) sits ahead of the title card (time=0.5), so it is
-    # unaffected by it.
+    # The title card fires with the take's first turn, so compose() drops
+    # the 0.5s lead-in ahead of it and opens on the card. "Before" (raw
+    # 0.0s) falls inside that dropped lead-in, so it lands where the output
+    # starts.
     assert cues[0] == pytest.approx((0.0, 0.5), abs=0.01)
-    # "During" (raw 1.0s) sits after the title card, so its 2.0s is added.
-    assert cues[1] == pytest.approx((3.0, 3.5), abs=0.01)
+    # "During" (raw 1.0s): less the 0.5s lead-in, plus the 2.0s card.
+    assert cues[1] == pytest.approx((2.5, 3.0), abs=0.01)
     output_duration = ffprobe_duration(output)
+    assert output_duration == pytest.approx(4.5, abs=0.5)
     assert cues[1][1] <= output_duration + 0.5
+
+
+# -- External PiP tracks (`tracks=`/`--track`) --------------------------

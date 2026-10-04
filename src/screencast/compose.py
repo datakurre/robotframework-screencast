@@ -230,20 +230,81 @@ def _view_at(t, focus_events, turns, tolerance=1e-6):
     )
 
 
-def _output_time(raw_time, chapter_events, hold_events):
+def _inserted_holds(hold_events, shift):
+    """The holds the composer actually inserts a synthetic freeze for: not a
+    "recorded" one (that time is already real observer footage; see
+    predicted_duration()'s own docstring), and not one inside the lead-in
+    `_leading_shift()` drops -- its boundary is dropped with the rest of the
+    lead-in, so no segment is ever emitted for it."""
+    return [
+        e for e in hold_events if not e.get("recorded") and e["time"] >= shift - 1e-6
+    ]
+
+
+def _output_time(raw_time, chapter_events, hold_events, shift=0.0):
     """Map `raw_time` (observer-clock, the same clock every timeline event
-    uses) to its position in the composed output: `raw_time` itself, plus
-    the duration of every chapter/hold segment the composer actually
-    inserts at or before it (title cards, and a non-"recorded" hold's
-    synthetic freeze -- a "recorded" hold adds nothing, since no segment
-    is inserted for it; see predicted_duration()'s own docstring for why)."""
+    uses) to its position in the composed output: `raw_time` less the
+    dropped lead-in `shift` (see `_leading_shift()`; a time inside the
+    lead-in maps to 0.0, where the output starts), plus the duration of
+    every chapter/hold segment the composer actually inserts at or before
+    it (title cards, and the holds `_inserted_holds()` keeps)."""
     inserted = sum(e["duration"] for e in chapter_events if e["time"] <= raw_time)
     inserted += sum(
         e["duration"]
-        for e in hold_events
-        if e["time"] <= raw_time and not e.get("recorded")
+        for e in _inserted_holds(hold_events, shift)
+        if e["time"] <= raw_time
     )
-    return raw_time + inserted
+    return max(0.0, raw_time - shift) + inserted
+
+
+def _leading_shift(chapter_events, turn_starts):
+    """Seconds to shift every timestamp back by when the take's first
+    chapter fires at or before its own turn starts -- i.e. nothing of
+    value plays in the raw observer footage ahead of it (Start Observer's
+    own load, the first turn's context creation and navigation), so
+    compose() drops that lead-in and opens directly on the card instead.
+    Shared by compose()'s own boundary handling and chapter_windows() so
+    the two can never drift apart on this edge case."""
+    if not chapter_events:
+        return 0.0
+    first_chapter_time = min(e["time"] for e in chapter_events)
+    first_turn_start = min(turn_starts, default=float("inf"))
+    if 0.0 < first_chapter_time <= first_turn_start:
+        return first_chapter_time
+    return 0.0
+
+
+def chapter_windows(timeline):
+    """Each chapter event's own `(start, end)` span in seconds within
+    compose()'s *output* -- not the raw observer-clock `time` timeline.json
+    itself stores -- accounting for every earlier chapter's inserted
+    duration and the frame-0 lead-in shift from `_leading_shift()`.
+
+    For anything compositing a secondary element onto an already-composed
+    output that needs to avoid a title card's span -- e.g. hiding an
+    externally recorded PiP track (a terminal, say) while a card is on
+    screen, the way a project might one-off `ffmpeg overlay` a recording
+    the engine itself never knew about on top of `compose()`'s own output.
+    See docs/extending.md."""
+    chapter_events = sorted(timeline.events_of("chapter"), key=lambda e: e["time"])
+    if not chapter_events:
+        return []
+    turn_starts = [e["time"] for e in timeline.events_of("turn_start")]
+    shift = _leading_shift(chapter_events, turn_starts)
+    # compose() emits every chapter at an instant before any hold at that
+    # same instant, so only a hold strictly earlier pushes a card back.
+    holds = _inserted_holds(timeline.events_of("hold"), shift)
+    windows = []
+    inserted_chapters = 0.0
+    for chapter in chapter_events:
+        inserted_holds = sum(
+            e["duration"] for e in holds if e["time"] < chapter["time"] - 1e-6
+        )
+        start = (chapter["time"] - shift) + inserted_chapters + inserted_holds
+        duration = float(chapter["duration"])
+        windows.append((start, start + duration))
+        inserted_chapters += duration
+    return windows
 
 
 def _format_vtt_timestamp(seconds):
@@ -253,10 +314,13 @@ def _format_vtt_timestamp(seconds):
     return f"{int(hours):02d}:{int(minutes):02d}:{remainder:06.3f}"
 
 
-def write_captions_vtt(vtt_path, caption_events, chapter_events, hold_events):
+def write_captions_vtt(
+    vtt_path, caption_events, chapter_events, hold_events, shift=0.0
+):
     """Write a WebVTT sidecar for `caption_events` (schema v2's optional
     "caption" event type) at `vtt_path`, mapping each one's raw time to
-    its actual position in the composed output via `_output_time()`.
+    its actual position in the composed output via `_output_time()` --
+    `shift` is the lead-in compose() drops (see `_leading_shift()`).
     `duration` shifts the cue's start the same way but is not itself
     stretched by an insertion that happens to fall *inside* it -- a
     caption is expected to describe one continuous stretch of real
@@ -265,7 +329,7 @@ def write_captions_vtt(vtt_path, caption_events, chapter_events, hold_events):
     for index, event in enumerate(
         sorted(caption_events, key=lambda e: e["time"]), start=1
     ):
-        start = _output_time(event["time"], chapter_events, hold_events)
+        start = _output_time(event["time"], chapter_events, hold_events, shift)
         end = start + float(event.get("duration", DEFAULT_CAPTION_DURATION))
         lines.append(str(index))
         lines.append(f"{_format_vtt_timestamp(start)} --> {_format_vtt_timestamp(end)}")
@@ -361,13 +425,29 @@ def compose(take_dir, output=None):
     ]
     turns_by_id = {turn_id: (start, end) for turn_id, _actor, start, end in turns}
 
+    # A turn's chapter event is timestamped when its first `Go To` finishes
+    # loading, not when `Start Actor Turn` opens the context (see
+    # library.py's start_actor_turn()/_record_turn_start()) -- so there is a
+    # real stretch of raw observer footage at the very start of a take,
+    # before the first chapter card, covering Start Observer's own load plus
+    # the first turn's context creation and navigation. When the take's
+    # first chapter fires at or before every turn's own start, the segment
+    # loop drops every boundary ahead of it (see below), so the output opens
+    # directly on that card -- chapters are pure insertions ahead of the
+    # live segment (see the module docstring), so this skips the unneeded
+    # raw rendering before it without skipping anything that was recorded.
+    shift = _leading_shift(chapter_events, [t[2] for t in turns])
+
     boundaries = {0.0, observer_duration}
     for _turn_id, _actor, start, end in turns:
         boundaries.add(start)
         boundaries.add(end)
     for event in focus_events + chapter_events + hold_events:
         boundaries.add(event["time"])
-    boundaries = sorted(boundaries)
+    # Everything before a leading first chapter is dropped (see `shift`
+    # above) -- every boundary inside the lead-in, not only 0.0, or the
+    # segments between them would still render it.
+    boundaries = sorted(b for b in boundaries if b >= shift - 1e-6)
 
     output = Path(output) if output else take_dir / "output.webm"
     title_dir = take_dir / "titles"
@@ -570,7 +650,11 @@ def compose(take_dir, output=None):
 
     if caption_events:
         write_captions_vtt(
-            output.with_suffix(".vtt"), caption_events, chapter_events, hold_events
+            output.with_suffix(".vtt"),
+            caption_events,
+            chapter_events,
+            hold_events,
+            shift,
         )
 
     return output

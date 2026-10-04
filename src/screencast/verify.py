@@ -6,9 +6,9 @@ Checks:
 
 - **ffprobe**: exactly one 1920x1080, 25fps video stream on the composed
   output, and its duration matches what the timeline predicts (the
-  observer's own measured length plus every chapter/hold duration, which
-  is exactly what the composer (screencast.compose) inserts), within
-  DURATION_TOLERANCE.
+  observer's own measured length, less any lead-in the composer drops,
+  plus every chapter/hold duration it inserts -- see
+  predicted_duration()), within DURATION_TOLERANCE.
 - **Contact sheet**: a `rows x cols` tile built at a sampling rate derived
   from the *real* measured duration (`fps >= rows*cols / duration`), so a
   longer take than the last one still gets full coverage instead of a
@@ -48,6 +48,8 @@ sheet to `contact-sheet.png` in the take directory.
 """
 
 from pathlib import Path
+from screencast.compose import _inserted_holds
+from screencast.compose import _leading_shift
 from screencast.compose import ffprobe_duration
 from screencast.timeline import Timeline
 import json
@@ -224,12 +226,30 @@ def predicted_duration(timeline, observer_duration):
     hold (e.g. the return-to-observer wait, see library.py's
     end_actor_turn) is excluded: the composer never inserts a synthetic
     freeze for it, since that time is already real, un-trimmed observer
-    footage -- counting it here would overshoot the actual output length."""
-    inserted = sum(e["duration"] for e in timeline.events_of("chapter"))
+    footage -- counting it here would overshoot the actual output length.
+
+    Also subtracts compose._leading_shift(): when the take's first chapter
+    fires at or before its own turn starts, compose() opens directly on
+    that card and drops the raw observer footage ahead of it (Start
+    Observer's own load, the first turn's context creation and
+    navigation -- see that function's own docstring) instead of rendering
+    it as a live segment first. That raw footage is real time the observer
+    recording measures but the composed output never includes, so counting
+    the observer's full measured length here would overstate the expected
+    total by exactly that dropped lead-in -- usually a second or two
+    (within DURATION_TOLERANCE, so invisible), but not always: a take
+    whose `Start Observing` does real unrecorded-observer-clock setup
+    *after* `Start Observer` (e.g. standing up a second track) before the
+    first turn opens can easily push the lead-in past a few seconds. A
+    hold inside that lead-in is dropped with it (compose._inserted_holds)."""
+    chapter_events = timeline.events_of("chapter")
+    turn_starts = [e["time"] for e in timeline.events_of("turn_start")]
+    shift = _leading_shift(chapter_events, turn_starts)
+    inserted = sum(e["duration"] for e in chapter_events)
     inserted += sum(
-        e["duration"] for e in timeline.events_of("hold") if not e.get("recorded")
+        e["duration"] for e in _inserted_holds(timeline.events_of("hold"), shift)
     )
-    return observer_duration + inserted
+    return observer_duration - shift + inserted
 
 
 def verify(take_dir, output_video=None, contact_sheet=None, rows=6, cols=5):

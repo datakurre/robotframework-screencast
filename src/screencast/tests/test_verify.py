@@ -210,6 +210,51 @@ def test_predicted_duration_excludes_a_recorded_hold(tmp_path):
     assert predicted_duration(timeline, observer_duration=5.0) == 7.0
 
 
+@requires_ffmpeg
+def test_predicted_duration_subtracts_a_dropped_leading_chapter(tmp_path):
+    """(regression) When the take's first chapter fires at or before its
+    own turn starts, compose() opens directly on the card and drops the
+    raw observer footage ahead of it (compose._leading_shift) -- counting
+    the observer's *full* measured length here would overstate the
+    expected total by exactly that dropped lead-in, which `verify()`'s own
+    duration check would then flag on an otherwise perfectly healthy
+    take (see its DURATION_TOLERANCE)."""
+    timeline = Timeline.new("observer.webm")
+    timeline.add_event({"type": "turn_start", "time": 6.0, "actor": "author"})
+    timeline.add_event(
+        {
+            "type": "chapter",
+            "time": 6.0,
+            "eyebrow": "e",
+            "title": "t",
+            "subtitle": "s",
+            "duration": 8.0,
+        }
+    )
+    # observer=20.0, lead-in dropped=6.0, chapter inserted=8.0 -> 20-6+8=22.0,
+    # not the naive 20.0+8.0=28.0 the old formula would have predicted.
+    assert predicted_duration(timeline, observer_duration=20.0) == 22.0
+
+
+def test_predicted_duration_excludes_a_hold_inside_the_dropped_lead_in():
+    """compose() drops a hold's boundary along with the rest of the lead-in,
+    so its freeze is never inserted and must not be expected either."""
+    timeline = Timeline.new("observer.webm")
+    timeline.add_event({"type": "hold", "time": 2.0, "duration": 3.0})
+    timeline.add_event({"type": "turn_start", "time": 6.0, "actor": "author"})
+    timeline.add_event(
+        {
+            "type": "chapter",
+            "time": 6.0,
+            "eyebrow": "e",
+            "title": "t",
+            "subtitle": "s",
+            "duration": 8.0,
+        }
+    )
+    assert predicted_duration(timeline, observer_duration=20.0) == 22.0
+
+
 def _take_with_waits(take_dir, waits):
     """A clean composed take whose timeline also records `waits` (a list of
     (time, duration, keyword))."""
