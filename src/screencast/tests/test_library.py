@@ -87,6 +87,87 @@ def test_actor_turn_records_matching_start_and_end_events(tmp_path):
     assert clicked_pages[0].clicked == ["text=Add new"]
 
 
+def test_actor_keywords_stay_on_the_turn_page_through_a_mid_turn_observe(tmp_path):
+    """(regression) A story that calls `Observe` (directly, or through a
+    project keyword built on it) in the middle of an actor turn -- to have
+    the Observer follow along live, rather than only between turns -- must
+    not have its later Human Click/Type/Wait Until Visible/... silently
+    redirected to the Observer's page. `observe()` reassigns the shared
+    `current_page` pointer as a side effect of bringing the Observer to the
+    front; `_page()` must route turn-scoped keywords through `_turn_page`
+    instead, which only the turn's own start/end ever touch."""
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    screencast.start_actor_turn("author")
+    screencast.go_to("http://example.test/actor")
+    screencast.human_click("text=Before")
+    screencast.observe("http://example.test/cockpit/instance/1")
+    screencast.human_click("text=After")
+    screencast.end_actor_turn()
+
+    actor_pages = [
+        page
+        for context in library_module._SESSION.browser.contexts
+        for page in context.pages
+        if page.url == "http://example.test/actor"
+    ]
+    assert len(actor_pages) == 1
+    assert actor_pages[0].clicked == ["text=Before", "text=After"]
+
+
+def test_end_actor_turn_records_the_turn_pages_own_video_through_a_mid_turn_observe(
+    tmp_path,
+):
+    """(regression) `end_actor_turn()` used to read `_SESSION.current_page`
+    directly -- the same single shared pointer `observe()` reassigns (see
+    the sibling test above) -- to decide *which page's video* becomes this
+    turn's own clip on the timeline. A mid-turn `Observe` left it pointed
+    at the Observer's page, so `end_actor_turn()` recorded the Observer's
+    own video file as if it were this turn's clip: composing later would
+    render the Observer's footage, trimmed at this turn's offsets, as the
+    "actor main" view -- indistinguishable on screen from two Cockpit
+    insets and no Tasklist at all."""
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    observer_video = library_module._SESSION.observer_page.video.path()
+
+    screencast.start_actor_turn("author")
+    screencast.go_to("http://example.test/actor")
+    actor_video = library_module._SESSION._turn_page.video.path()
+    screencast.observe("http://example.test/cockpit/instance/1")
+    screencast.end_actor_turn()
+
+    clip = library_module._SESSION.timeline.actor_clip("author")
+    assert clip["video"] == Path(actor_video).name
+    assert clip["video"] != Path(observer_video).name
+
+    observer_page = library_module._SESSION.observer_page
+    assert observer_page.clicked == []
+
+
+def test_get_observer_page_stays_on_the_observer_through_an_open_turn(tmp_path):
+    """(regression) A project keyword that needs to interact with
+    something living on the Observer's own page (a toggle button, say)
+    from *within* an open actor turn -- the point of driving the Observer
+    mid-turn via a `Follow Instance Live`-style keyword at all -- must not
+    go through `self._page()`/`Get Current Page`: those are turn-aware by
+    design (see `_page()`'s own docstring) and would silently resolve to
+    the turn's own page instead, exactly like `Reload Current Page` and
+    `end_actor_turn()`'s own video selection did before each was fixed.
+    `Get Observer Page`/`get_observer_page()` is the escape hatch."""
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    observer_page = library_module._SESSION.observer_page
+
+    screencast.start_actor_turn("author")
+    screencast.go_to("http://example.test/actor")
+
+    assert screencast.get_observer_page() is observer_page
+    assert screencast.get_current_page() is not observer_page
+
+    screencast.end_actor_turn()
+
+
 def test_turn_start_is_deferred_to_the_first_go_to(tmp_path):
     """(regression, #17) turn_start/chapter used to be recorded at context
     creation, before the turn's page had navigated anywhere -- the

@@ -654,7 +654,16 @@ class Screencast:
         # Fallback for a turn that never navigated (Go To normally records
         # this at the first painted frame instead -- see go_to()).
         self._record_turn_start(at=_SESSION._turn_started_at)
-        page = _SESSION.current_page
+        # `_turn_page`, not `current_page`: the latter is a single shared
+        # pointer `observe()`/`start_track()` reassign as a side effect of
+        # bringing a different page to the front, so a story that calls an
+        # Observer-driving keyword (directly, or e.g. via a project's own
+        # "Follow Instance Live") anywhere in this turn -- including right
+        # before this very call -- would otherwise have this turn's own
+        # clip silently recorded as *that other page's* video instead of
+        # its own, with no error (see `_page()`'s own docstring for the
+        # same bug in every other turn-scoped keyword, fixed the same way).
+        page = _SESSION._turn_page
         video_path = page.video.path() if _SESSION.record and page.video else None
         context.close()
         end_offset = _SESSION.elapsed()
@@ -988,14 +997,51 @@ class Screencast:
         for a JSON fetch, or `.keyboard`)."""
         return self._page()
 
+    def get_observer_page(self):
+        """Return the raw Playwright Page for the Observer specifically,
+        regardless of whether an actor turn is currently open -- unlike
+        `Get Current Page`/every other keyword here, which routes through
+        `_page()` and so stays pinned to an open turn's own page by design
+        (see `_page()`'s own docstring: that is what keeps a mid-turn
+        `Observe` call from hijacking the rest of the turn's Human Click/
+        Type/Wait Until Visible). A project keyword that itself needs to
+        interact with something living on the Observer's own page (a
+        toggle button, say) from *within* an open turn -- the whole point
+        of driving the Observer mid-turn via a `Follow Instance Live`-style
+        keyword -- needs this instead, or it would silently operate on the
+        turn's own page too."""
+        if _SESSION.observer_page is None:
+            raise FatalError("No observer -- call Start Observer first")
+        return _SESSION.observer_page
+
     def take_screenshot(self, path, full_page=True):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._page().screenshot(path=str(path), full_page=_as_bool(full_page))
 
     def _page(self):
-        if _SESSION.current_page is None:
+        # While an actor turn is open, every input/wait/read keyword must
+        # stay pinned to *that turn's own page* -- not whatever page was
+        # driven most recently. `current_page` is a single shared pointer
+        # that `observe()` (and `start_scratch_context()`) reassign as a
+        # side effect of simply bringing a different page to the front; a
+        # story that calls an Observer-driving keyword (e.g. `Observe`, or
+        # a project keyword built on it) in between a turn's own keywords --
+        # to have the Observer follow along live, mid-turn, rather than only
+        # between turns -- would otherwise silently redirect every
+        # subsequent Human Click/Type/Wait Until Visible/... in that turn to
+        # the Observer's page instead, with no error: selectors just never
+        # match on a page the story never intended to drive. `_turn_page` is
+        # set once, when the turn opens, and untouched by anything else
+        # until the turn ends, so it is the one reliable answer to "which
+        # page is this turn's own" regardless of what else ran in between.
+        page = (
+            _SESSION._turn_page
+            if _SESSION._turn_context is not None
+            else _SESSION.current_page
+        )
+        if page is None:
             raise FatalError("No open page -- call Start Observer first")
-        return _SESSION.current_page
+        return page
 
 
 def _basic_auth_headers(username, password):
