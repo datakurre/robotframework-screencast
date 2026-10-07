@@ -67,6 +67,15 @@ def main(argv=None):
     run_parser.add_argument("--take", default=None, help="Take directory")
     run_parser.add_argument("--headed", action="store_true")
     run_parser.add_argument(
+        "--cdp",
+        default=None,
+        metavar="[NAME=]PORT|URL,...",
+        help="Attach to running Chromium over CDP instead of launching one "
+        "(default: $SCREENCAST_CDP). A named browser plays the actor, track "
+        "or observer of that name; the first one plays everything else. "
+        "Takes $AGENT_SANDBOX_BROWSER_CDP_PORT as is",
+    )
+    run_parser.add_argument(
         "--repl-on-failure",
         action="store_true",
         help="On the first unrecovered failure, pause before teardown and "
@@ -80,6 +89,15 @@ def main(argv=None):
     probe_parser.add_argument("--take", default=".")
     probe_parser.add_argument("--record", action="store_true")
     probe_parser.add_argument("--headed", action="store_true")
+    probe_parser.add_argument(
+        "--cdp",
+        default=None,
+        metavar="[NAME=]PORT|URL,...",
+        help="Attach to running Chromium over CDP instead of launching one "
+        "(default: $SCREENCAST_CDP). A named browser plays the actor, track "
+        "or observer of that name; the first one plays everything else. "
+        "Takes $AGENT_SANDBOX_BROWSER_CDP_PORT as is",
+    )
     probe_parser.add_argument("--repl", action="store_true")
 
     keywords_parser = subparsers.add_parser(
@@ -132,6 +150,7 @@ def main(argv=None):
             record=not args.no_record,
             take_dir=args.take,
             headless=not args.headed,
+            cdp=args.cdp,
             repl_on_failure=args.repl_on_failure,
         )
         return code
@@ -143,6 +162,7 @@ def main(argv=None):
                 take_dir=args.take,
                 record=args.record,
                 headless=not args.headed,
+                cdp=args.cdp,
             )
             return 0
         return driver.probe(
@@ -152,6 +172,7 @@ def main(argv=None):
             take_dir=args.take,
             record=args.record,
             headless=not args.headed,
+            cdp=args.cdp,
         )
 
     if args.command == "keywords":

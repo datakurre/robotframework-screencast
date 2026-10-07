@@ -179,9 +179,18 @@ class FakeContext:
 class FakeChromium:
     def __init__(self, browser):
         self._browser = browser
+        self.launched = None
+        self.attached = []
 
     def launch(self, headless=True, args=None):
+        self.launched = {"headless": headless, "args": args}
         return self._browser
+
+    def connect_over_cdp(self, endpoint_url):
+        browser = FakeBrowser()
+        browser.endpoint_url = endpoint_url
+        self.attached.append(browser)
+        return browser
 
 
 class FakeBrowser:

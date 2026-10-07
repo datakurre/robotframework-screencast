@@ -82,7 +82,10 @@ Wait For Task
   itself; provide the browser the way your environment does (a Nix
   `playwright-driver.browsers`, or `playwright install chromium` yourself). The
   `SCREENCAST_CHROMIUM_PATH` environment variable points it at a specific
-  Chromium build.
+  Chromium build. Alternatively, `--cdp` (or `SCREENCAST_CDP`) attaches it to
+  a Chromium that is already running — a visible one on the host of a
+  container, say — with one browser per persona if you like; see
+  [Getting started](https://datakurre.github.io/robotframework-screencast/getting-started/).
 
 Not published to PyPI, and no release is planned for now. Install from git:
 

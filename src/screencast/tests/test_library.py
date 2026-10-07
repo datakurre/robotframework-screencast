@@ -929,3 +929,86 @@ def test_actor_turn_still_needs_an_observer_when_recording(tmp_path):
     screencast = library_module.Screencast(take_dir=tmp_path)
     with pytest.raises(FatalError, match="No observer"):
         screencast.start_actor_turn("alice")
+
+
+@pytest.mark.parametrize(
+    "spec, expected",
+    [
+        ("9222", {"": "http://127.0.0.1:9222"}),
+        ("http://host.test:9222", {"": "http://host.test:9222"}),
+        (
+            "ws://127.0.0.1:9222/devtools/browser/x",
+            {"": "ws://127.0.0.1:9222/devtools/browser/x"},
+        ),
+        (
+            "alice=9222, bob=http://127.0.0.1:9223",
+            {"alice": "http://127.0.0.1:9222", "bob": "http://127.0.0.1:9223"},
+        ),
+    ],
+)
+def test_parse_cdp_accepts_ports_urls_and_named_entries(spec, expected):
+    assert library_module.parse_cdp(spec) == expected
+
+
+@pytest.mark.parametrize("spec", ["", "alice=", "localhost:9222", "a=1,a=2"])
+def test_parse_cdp_rejects_what_it_cannot_dial(spec):
+    with pytest.raises(ValueError):
+        library_module.parse_cdp(spec)
+
+
+def test_cdp_attaches_instead_of_launching(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path, cdp="9222")
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    chromium = FakePlaywright.instances[0].chromium
+    assert chromium.launched is None
+    assert [b.endpoint_url for b in chromium.attached] == ["http://127.0.0.1:9222"]
+    # Still a fresh, recorded context with the cursor -- only the browser
+    # it opens in changed.
+    context = chromium.attached[0].contexts[0]
+    assert "record_video_dir" in context.kwargs
+    assert library_module.CURSOR_SCRIPT in context.init_scripts
+
+
+def test_cdp_comes_from_the_environment_when_not_passed(tmp_path, monkeypatch):
+    monkeypatch.setenv("SCREENCAST_CDP", "9333")
+    screencast = library_module.Screencast(take_dir=tmp_path)
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    chromium = FakePlaywright.instances[0].chromium
+    assert [b.endpoint_url for b in chromium.attached] == ["http://127.0.0.1:9333"]
+
+
+def test_each_persona_plays_in_its_own_named_browser(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path, cdp="alice=9222,bob=9223")
+    screencast.start_observer("cockpit", "http://example.test/cockpit")
+    for actor in ("Bob", "alice", "carol"):
+        screencast.start_actor_turn(actor)
+        screencast.end_actor_turn(return_to_observer=False)
+    alice, bob = FakePlaywright.instances[0].chromium.attached
+    # The observer and an actor with no browser of its own use the first;
+    # names match case-insensitively.
+    assert len(alice.contexts) == 3
+    assert len(bob.contexts) == 1
+
+
+def test_stop_browser_disconnects_every_attached_browser(tmp_path):
+    screencast = library_module.Screencast(take_dir=tmp_path, cdp="alice=9222,bob=9223")
+    screencast.start_browser()
+    playwright = FakePlaywright.instances[0]
+    screencast.stop_browser()
+    assert all(browser.closed for browser in playwright.chromium.attached)
+    assert playwright.stopped
+    assert library_module._SESSION.browsers == {}
+
+
+def test_an_unreachable_cdp_endpoint_fails_the_run_with_its_address(
+    tmp_path, monkeypatch
+):
+    from screencast.tests.fakes import FakeChromium
+
+    def refuse(self, endpoint_url):
+        raise RuntimeError("connect ECONNREFUSED")
+
+    monkeypatch.setattr(FakeChromium, "connect_over_cdp", refuse)
+    screencast = library_module.Screencast(take_dir=tmp_path, cdp="alice=9222")
+    with pytest.raises(FatalError, match="'alice' over CDP at http://127.0.0.1:9222"):
+        screencast.start_browser()

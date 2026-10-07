@@ -18,6 +18,7 @@ from robot.running import TestSuite
 from robot.running.builder import ResourceFileBuilder
 from screencast.console import TaskConsole
 from screencast.library import _RECOVERING_WRAPPER_KEYWORDS
+from screencast.library import configure_browser
 from screencast.library import Screencast
 from screencast.library import STATE_FILE
 import datetime
@@ -70,6 +71,7 @@ def run(
     record=True,
     take_dir=None,
     headless=True,
+    cdp=None,
     quiet=False,
     repl_on_failure=False,
     repl_stdin=None,
@@ -84,7 +86,13 @@ def run(
     before the failing task's own [Teardown] closes its page, and drops
     into a synchronous keyword REPL against that same live session -- see
     the class docstring for why this calls BuiltIn().run_keyword()
-    in-process rather than driver.probe()'s throwaway TestSuite."""
+    in-process rather than driver.probe()'s throwaway TestSuite.
+
+    `cdp` attaches to running browsers instead of launching one -- see
+    `screencast.library.parse_cdp` for its `[NAME=]PORT|URL,...` shape."""
+    # The story's own `Library` import does not pass these, and a value it
+    # does pass still wins, since the import runs after this.
+    configure_browser(headless=headless, cdp=cdp)
     take_dir = Path(take_dir) if take_dir else default_take_dir(story)
     take_dir.mkdir(parents=True, exist_ok=True)
     output = take_dir / "output.json"
@@ -275,7 +283,9 @@ def _summarize_keyword(item, path, lines):
             lines.append(f"    {message.message}")
 
 
-def probe(resource, keyword, args=(), take_dir=".", record=False, headless=True):
+def probe(
+    resource, keyword, args=(), take_dir=".", record=False, headless=True, cdp=None
+):
     """Run one keyword against the live session -- the browser started by a
     previous `run`/`probe` call in this process survives, per
     screencast.library's module-level session state. Builds a throwaway
@@ -285,10 +295,10 @@ def probe(resource, keyword, args=(), take_dir=".", record=False, headless=True)
     take_dir = Path(take_dir)
     take_dir.mkdir(parents=True, exist_ok=True)
     suite = TestSuite(name="Probe")
-    suite.resource.imports.library(
-        "screencast.Screencast",
-        args=(f"take_dir={take_dir}", f"record={record}", f"headless={headless}"),
-    )
+    library_args = [f"take_dir={take_dir}", f"record={record}", f"headless={headless}"]
+    if cdp:
+        library_args.append(f"cdp={cdp}")
+    suite.resource.imports.library("screencast.Screencast", args=tuple(library_args))
     if resource:
         # This suite is built in memory (not TestSuite.from_file_system), so
         # it has no source file for Robot to resolve a relative import
@@ -305,7 +315,7 @@ def probe(resource, keyword, args=(), take_dir=".", record=False, headless=True)
     return result.return_code
 
 
-def repl(resource, take_dir=".", record=False, headless=True):
+def repl(resource, take_dir=".", record=False, headless=True, cdp=None):
     """Interactive mode: read one keyword call per line from stdin (space
     separated: `Keyword Name    arg1    arg2`), run it against the live
     session, print its status, and keep going -- Ctrl-D / an empty line to
@@ -319,7 +329,13 @@ def repl(resource, take_dir=".", record=False, headless=True):
         parts = [part.strip() for part in parts if part.strip()]
         name, args = parts[0], parts[1:]
         code = probe(
-            resource, name, args, take_dir=take_dir, record=record, headless=headless
+            resource,
+            name,
+            args,
+            take_dir=take_dir,
+            record=record,
+            headless=headless,
+            cdp=cdp,
         )
         print("OK" if code == 0 else "FAIL")
 

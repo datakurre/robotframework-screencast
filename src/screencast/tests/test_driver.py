@@ -131,6 +131,40 @@ def test_run_passes_and_writes_a_timeline(tmp_path):
     assert timeline_path.exists()
 
 
+def test_run_applies_headed_and_cdp_the_story_import_does_not_pass(tmp_path):
+    """(regression) `run --headed` used to be dropped: only probe() put
+    `headless` on the library import, and a story's own import never does."""
+    story = write_story(tmp_path, PASSING_STORY)
+    code, _ = driver.run(story, take_dir=tmp_path / "take", headless=False, quiet=True)
+    assert code == 0
+    assert FakePlaywright.instances[0].chromium.launched["headless"] is False
+
+
+def test_run_with_cdp_attaches_instead_of_launching(tmp_path):
+    story = write_story(tmp_path, PASSING_STORY)
+    code, _ = driver.run(
+        story, take_dir=tmp_path / "take", cdp="9222,author=9223", quiet=True
+    )
+    assert code == 0
+    chromium = FakePlaywright.instances[0].chromium
+    assert chromium.launched is None
+    default, author = chromium.attached
+    assert len(default.contexts) == 1  # the observer
+    assert len(author.contexts) == 1  # the author's turn
+
+
+def test_probe_passes_cdp_to_the_library(tmp_path):
+    driver.probe(
+        None,
+        "Start Observer",
+        ["observer", "http://example.test"],
+        take_dir=tmp_path / "take",
+        cdp="9222",
+    )
+    chromium = FakePlaywright.instances[0].chromium
+    assert [b.endpoint_url for b in chromium.attached] == ["http://127.0.0.1:9222"]
+
+
 def test_run_with_task_runs_only_that_task(tmp_path):
     story = write_story(tmp_path, PASSING_STORY)
     code, output = driver.run(

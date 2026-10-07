@@ -119,6 +119,11 @@ class _Session:
     def reset(self):
         self.playwright = None
         self.browser = None
+        # Browsers attached over CDP, by name ("" for an unnamed endpoint),
+        # in the order given; `browser` is the first of them. Empty when the
+        # engine launched its own.
+        self.browsers = {}
+        self.cdp = None
         self.headless = True
         self.record = True
         self.take_dir = None
@@ -324,6 +329,61 @@ def _track_console(page):
     )
 
 
+def parse_cdp(spec):
+    """Parse a CDP attach spec into {name: endpoint URL}, in order.
+
+    Accepts a comma-separated list of `[NAME=]ENDPOINT`, where ENDPOINT is a
+    bare port (on 127.0.0.1) or an `http://`/`ws://` URL -- the same
+    `alice=9222,bob=9223` shape agent-sandbox's
+    `$AGENT_SANDBOX_BROWSER_CDP_PORT` carries, so it can be passed through
+    unchanged. An entry without a name is stored under ""."""
+    endpoints = {}
+    for entry in str(spec).split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, sep, endpoint = entry.rpartition("=")
+        if not sep:
+            name, endpoint = "", entry
+        name, endpoint = name.strip(), endpoint.strip()
+        if endpoint.isdigit():
+            endpoint = f"http://127.0.0.1:{endpoint}"
+        elif "://" not in endpoint:
+            raise ValueError(
+                f"Not a CDP endpoint: {entry!r} -- expected a port or an "
+                "http:// or ws:// URL, optionally prefixed with NAME="
+            )
+        if name in endpoints:
+            raise ValueError(f"CDP browser {name!r} is given twice in {spec!r}")
+        endpoints[name] = endpoint
+    if not endpoints:
+        raise ValueError(f"No CDP endpoint in {spec!r}")
+    return endpoints
+
+
+def configure_browser(headless=None, cdp=None):
+    """Set how `start_browser` gets its browser, for callers (the driver)
+    that run a story whose own `Library` import does not pass these. Only
+    arguments that were actually passed change the session, same rule as
+    `Screencast.__init__`."""
+    if headless is not None:
+        _SESSION.headless = _as_bool(headless)
+    if cdp:
+        _SESSION.cdp = parse_cdp(cdp)
+
+
+def _browser_for(name):
+    """The browser a context for `name` (an actor, the observer, a track)
+    opens in: the attached browser of that name when there is one, so each
+    persona can play in its own host window, else the default one."""
+    if name:
+        wanted = str(name).casefold()
+        for browser_name, browser in _SESSION.browsers.items():
+            if browser_name.casefold() == wanted:
+                return browser
+    return _SESSION.browser
+
+
 def _state_path():
     return Path(_SESSION.take_dir) / STATE_FILE
 
@@ -361,7 +421,9 @@ class Screencast:
     ROBOT_LIBRARY_SCOPE = "GLOBAL"
     ROBOT_LIBRARY_LISTENER = _Listener()
 
-    def __init__(self, take_dir=None, record=None, headless=None, viewport=None):
+    def __init__(
+        self, take_dir=None, record=None, headless=None, viewport=None, cdp=None
+    ):
         # Only arguments that were actually passed change the session. Robot
         # Framework constructs a library instance for *every* import of it,
         # and a story's own `Library screencast.Screencast take_dir=... ` is
@@ -375,8 +437,7 @@ class Screencast:
             _SESSION.take_dir = Path(".")
         if record is not None:
             _SESSION.record = _as_bool(record)
-        if headless is not None:
-            _SESSION.headless = _as_bool(headless)
+        configure_browser(headless=headless, cdp=cdp)
         if viewport:
             _SESSION.viewport = viewport
         if _SESSION.timeline is None:
@@ -388,13 +449,43 @@ class Screencast:
         """Start Playwright and launch Chromium, unless a previous call (in
         this same process) already did -- the browser instance is reused
         across `TestSuite.run()` calls, which is what makes `probe`/REPL
-        debugging possible. Never launches a second browser."""
+        debugging possible. Never launches a second browser.
+
+        With a CDP spec (`cdp=`, `--cdp`, or `$SCREENCAST_CDP`), attaches to
+        already-running browsers instead -- e.g. a visible one on the host
+        of a container that has no display. Every recorded context is still
+        a fresh one the engine opens and closes itself, so recording,
+        cursor injection and the timeline work the same; only where the
+        pixels are drawn changes."""
         if _SESSION.browser is not None:
             return
+        if _SESSION.cdp is None and os.environ.get("SCREENCAST_CDP"):
+            try:
+                _SESSION.cdp = parse_cdp(os.environ["SCREENCAST_CDP"])
+            except ValueError as error:
+                raise FatalError(f"SCREENCAST_CDP: {error}") from error
         try:
             from playwright.sync_api import sync_playwright
 
             _SESSION.playwright = sync_playwright().start()
+        except Exception as error:
+            raise FatalError(f"Could not start Playwright: {error}") from error
+        if _SESSION.cdp:
+            for name, endpoint in _SESSION.cdp.items():
+                try:
+                    browser = _SESSION.playwright.chromium.connect_over_cdp(endpoint)
+                except Exception as error:
+                    label = f"browser {name!r}" if name else "the browser"
+                    raise FatalError(
+                        f"Could not attach to {label} over CDP at {endpoint}: "
+                        f"{error} -- is it running, and is its port reachable "
+                        "from here?"
+                    ) from error
+                _SESSION.browsers[name] = browser
+                if _SESSION.browser is None:
+                    _SESSION.browser = browser
+            return
+        try:
             launch_kwargs = {
                 "headless": _SESSION.headless,
                 "args": ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -414,12 +505,17 @@ class Screencast:
     def stop_browser(self):
         """Close every open context/page and shut Playwright down. Only the
         top-level driver command calls this at the very end of a process --
-        never between `run()` calls, or the session would not survive."""
+        never between `run()` calls, or the session would not survive.
+
+        A browser attached over CDP is only disconnected from: `close()` on
+        it drops the contexts this session created and leaves the browser
+        itself, and whatever tabs it had, running."""
         for page in list(_SESSION.open_pages):
             if not page.is_closed():
                 page.close()
-        if _SESSION.browser is not None:
-            _SESSION.browser.close()
+        for browser in list(_SESSION.browsers.values()) or [_SESSION.browser]:
+            if browser is not None:
+                browser.close()
         if _SESSION.playwright is not None:
             _SESSION.playwright.stop()
         _SESSION.reset()
@@ -440,7 +536,7 @@ class Screencast:
         if storage_state:
             context_kwargs["storage_state"] = storage_state
         try:
-            context = _SESSION.browser.new_context(**context_kwargs)
+            context = _browser_for(name).new_context(**context_kwargs)
             context.add_init_script(CURSOR_SCRIPT)
             page = context.new_page()
             # Recording begins here, at page creation -- not at the first
@@ -585,7 +681,7 @@ class Screencast:
         if storage_state:
             context_kwargs["storage_state"] = storage_state
         try:
-            context = _SESSION.browser.new_context(**context_kwargs)
+            context = _browser_for(name).new_context(**context_kwargs)
             context.add_init_script(CURSOR_SCRIPT)
             page = context.new_page()
             # Same reasoning as start_observer(): capture the offset at
@@ -765,7 +861,7 @@ class Screencast:
                 actor, password or actor
             )
         try:
-            context = _SESSION.browser.new_context(**context_kwargs)
+            context = _browser_for(actor).new_context(**context_kwargs)
             context.add_init_script(CURSOR_SCRIPT)
             page = context.new_page()
             # The injected cursor's CSS centers it by default, but Chromium
